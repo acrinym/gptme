@@ -171,10 +171,15 @@ def _read_config_text(path: str | Path) -> str:
     value leave the document well-formed -- so replacement is treated as a guess
     too, and the more damaging one: U+FFFD discards which byte it stood for, so
     only the backup can undo it.
+
+    Newlines are normalized to LF after decoding. TOML allows LF and CRLF, but
+    tomlkit rejects bare CR (common after Windows editors produce ``\\r\\r\\n``).
+    Normalizing in memory keeps gptme-server from dying on an otherwise valid
+    config; the next successful write re-saves as LF.
     """
     data = Path(path).read_bytes()
     try:
-        return data.decode("utf-8")
+        return _normalize_toml_newlines(data.decode("utf-8"))
     except UnicodeDecodeError:
         pass
 
@@ -192,7 +197,7 @@ def _read_config_text(path: str | Path) -> str:
             "rewrites the file as UTF-8."
         )
         _mark_encoding_unverified(path)
-        return text
+        return _normalize_toml_newlines(text)
 
     logger.warning(
         f"Config file {path} is not valid UTF-8 and no legacy codec could decode "
@@ -200,7 +205,17 @@ def _read_config_text(path: str | Path) -> str:
         "and the original bytes are saved before anything rewrites the file."
     )
     _mark_encoding_unverified(path)
-    return data.decode("utf-8", errors="replace")
+    return _normalize_toml_newlines(data.decode("utf-8", errors="replace"))
+
+
+def _normalize_toml_newlines(text: str) -> str:
+    """Normalize CRLF and bare CR to LF for tomlkit.
+
+    tomlkit raises ``InvalidControlChar`` on bare ``\\r`` (code 0x0d). Mixed
+    Windows line endings such as ``\\r\\r\\n`` therefore crash config load and
+    take down gptme-server (including the Tauri sidecar).
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 # Define the path to the config file
@@ -299,11 +314,11 @@ def get_user_config_runtime_path(path: str | None = None) -> Path:
 def _load_runtime_config_doc(path: str | None = None) -> TOMLDocument | None:
     """Read runtime defaults without creating, repairing, or rewriting the file."""
     runtime_path = get_user_config_runtime_path(path)
-    try:
-        text = runtime_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    if not runtime_path.exists():
         return None
-    except (OSError, UnicodeError) as exc:
+    try:
+        text = _read_config_text(runtime_path)
+    except OSError as exc:
         raise ValueError(
             f"Could not read runtime config {runtime_path}: {exc}"
         ) from exc

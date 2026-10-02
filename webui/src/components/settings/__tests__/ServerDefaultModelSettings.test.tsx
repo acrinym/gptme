@@ -174,4 +174,20 @@ describe('ServerDefaultModelSettings', () => {
       'anthropic/claude-sonnet-4-7 from config.runtime.toml'
     );
   });
+
+  it('renders an object-shaped API error as human-readable text', async () => {
+    mockFetch.mockResolvedValue({
+      ok: false,
+      json: async () => ({ error: { message: 'OpenRouter rejected the selected model' } }),
+    });
+
+    render(<ServerDefaultModelSettings />);
+
+    fireEvent.click(screen.getByRole('button', { name: /save default model/i }));
+
+    await waitFor(() => {
+      expect(mockError).toHaveBeenCalledWith('OpenRouter rejected the selected model');
+    });
+    expect(mockError).not.toHaveBeenCalledWith('[object Object]');
+  });
 });

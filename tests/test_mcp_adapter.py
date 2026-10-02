@@ -93,6 +93,27 @@ def test_create_mcp_tools_disabled(mock_disabled_config):
     assert tools == []
 
 
+def test_create_mcp_tools_skips_disabled_servers(mock_mcp_client):
+    """Per-server enabled=false must not open a stdio connection."""
+    config = Config()
+    config.user.mcp = MCPConfig(
+        enabled=True,
+        servers=[
+            MCPServerConfig(
+                name="off-server",
+                enabled=False,
+                command="should-not-run",
+            ),
+        ],
+    )
+    with patch(
+        "gptme.mcp.client.MCPClient", return_value=mock_mcp_client
+    ) as client_cls:
+        tools = create_mcp_tools(config)
+    assert tools == []
+    client_cls.assert_not_called()
+
+
 def test_create_mcp_tools_enabled(mock_config, mock_mcp_client):
     """Test create_mcp_tools when MCP is enabled."""
     with patch("gptme.mcp.client.MCPClient", return_value=mock_mcp_client):

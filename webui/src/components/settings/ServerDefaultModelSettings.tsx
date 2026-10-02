@@ -4,6 +4,7 @@ import { ModelPickerButton } from '@/components/ModelPicker';
 import { useApi } from '@/contexts/ApiContext';
 import { useModels } from '@/hooks/useModels';
 import { useUserSettings, type UserSettingSource } from '@/hooks/useUserSettings';
+import { formatUnknownError, messageFromApiErrorBody } from '@/utils/errors';
 import { toast } from 'sonner';
 
 type SaveDefaultModelResponse = {
@@ -90,9 +91,14 @@ export function ServerDefaultModelSettings() {
         body: JSON.stringify({ model: selectedModel }),
       });
 
-      const data = (await response.json()) as SaveDefaultModelResponse | { error?: string };
+      let data: SaveDefaultModelResponse | unknown = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
       if (!response.ok) {
-        throw new Error('error' in data && data.error ? data.error : 'Failed to save model');
+        throw new Error(messageFromApiErrorBody(data, 'Failed to save model'));
       }
 
       const result = data as SaveDefaultModelResponse;
@@ -106,7 +112,7 @@ export function ServerDefaultModelSettings() {
           : 'Default model updated.'
       );
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to save model');
+      toast.error(formatUnknownError(error, 'Failed to save model'));
     } finally {
       setIsSaving(false);
     }

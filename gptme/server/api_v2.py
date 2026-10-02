@@ -854,6 +854,7 @@ def api_server_health():
 
 
 @v2_api.route("/api/v2")
+@v2_api.route("/api/v2/")
 @api_doc_simple(responses={200: ApiRootResponse}, tags=["meta"])
 def api_root():
     """V2 API root.

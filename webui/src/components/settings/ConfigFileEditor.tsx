@@ -6,6 +6,7 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useApi } from '@/contexts/ApiContext';
+import { formatUnknownError, messageFromApiErrorBody } from '@/utils/errors';
 
 type ConfigFileResponse = {
   content: string;
@@ -20,28 +21,24 @@ type ConfigFileResponse = {
   status?: string;
 };
 
-type ConfigFileErrorResponse = {
-  error?: string;
-};
-
 async function parseConfigFileResponse(
   response: Response,
   fallbackMessage: string
 ): Promise<ConfigFileResponse> {
   const data = (await response.json().catch(() => null)) as
     | ConfigFileResponse
-    | ConfigFileErrorResponse
+    | Record<string, unknown>
     | null;
 
   if (!response.ok) {
-    throw new Error(data && 'error' in data && data.error ? data.error : fallbackMessage);
+    throw new Error(messageFromApiErrorBody(data, fallbackMessage));
   }
 
-  if (!data || !('content' in data)) {
+  if (!data || !('content' in data) || typeof data.content !== 'string') {
     throw new Error(fallbackMessage);
   }
 
-  return data;
+  return data as ConfigFileResponse;
 }
 
 export function ConfigFileEditor() {
@@ -79,8 +76,7 @@ export function ConfigFileEditor() {
       setContent(data.content);
       setSavedContent(data.content);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to load config file';
-      setError(message);
+      setError(formatUnknownError(err, 'Failed to load config file'));
     } finally {
       setIsLoading(false);
     }
@@ -105,7 +101,7 @@ export function ConfigFileEditor() {
       setSavedContent(data.content);
       toast.success('Config file saved.');
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to save config file';
+      const message = formatUnknownError(err, 'Failed to save config file');
       setError(message);
       toast.error(message);
     } finally {

@@ -46,6 +46,7 @@ def init(
     no_confirm: bool = False,
     server: bool = False,
     require_llm: bool = True,
+    include_mcp: bool = True,
 ):
     """Initialize gptme.
 
@@ -59,6 +60,8 @@ def init(
         require_llm: If True (default), raise when LLM initialization fails.
             If False, log a warning and continue without a default model —
             callers (e.g. the server) can still accept per-request models.
+        include_mcp: If False, skip connecting MCP servers during init so a
+            server can bind its HTTP port first (gptme-tauri).
     """
     global _init_done
     if _init_done:
@@ -85,7 +88,7 @@ def init(
             "Clients must supply a model per-request, or set an API key and restart.",
             first_line,
         )
-    init_tools(tool_allowlist)
+    init_tools(tool_allowlist, include_mcp=include_mcp)
     _register_core_compaction_hook()
     init_hooks(interactive=interactive, no_confirm=no_confirm, server=server)
 

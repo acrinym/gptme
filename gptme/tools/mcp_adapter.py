@@ -210,7 +210,10 @@ def create_mcp_tools(
     connections session-scoped instead of adding them to gptme's global registry.
     """
     tool_specs: list[ToolSpec] = []
-    server_configs = config.mcp.servers if servers is None else servers
+    if servers is None:
+        server_configs = [s for s in config.mcp.servers if s.enabled]
+    else:
+        server_configs = servers
 
     # Skip if MCP is disabled, unless a protocol host explicitly supplied servers.
     # Checked before the MCPClient import: pulling in the mcp SDK costs ~0.5s+.

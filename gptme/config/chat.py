@@ -21,11 +21,11 @@ from typing_extensions import Self
 if sys.version_info >= (3, 11):
     import tomllib
 
-    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError)
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError)
 else:
     tomllib = None
 
-    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, TOMLKitError)
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, ValueError, TOMLKitError)
 
 from ..context.config import parse_context_budget
 from ..util import path_with_tilde

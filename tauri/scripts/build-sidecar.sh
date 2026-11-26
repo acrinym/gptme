@@ -106,8 +106,10 @@ else
     uv pip install --quiet ".[server]" pyinstaller
 fi
 # Build using the spec so hiddenimports (hooks, context providers, etc.)
-# are collected correctly. The spec already defines onefile mode and name.
-uv run pyinstaller scripts/pyinstaller/gptme-server.spec
+# are collected correctly. Tauri bundles the frontend separately through
+# frontendDist, so exclude the standalone webui-dist to avoid a redundant
+# bundle and permit building from a fresh checkout without make bundle-webui.
+GPTME_PYINSTALLER_EXCLUDE_WEBUI=1 uv run pyinstaller scripts/pyinstaller/gptme-server.spec
 
 # Rename to include target triple (Tauri sidecar convention)
 _uvlock_state=0; if [[ -f "$REPO_ROOT/uv.lock" ]]; then _uvlock_state=1; fi

@@ -30,6 +30,7 @@ from gptme.logmanager.eventlog import (
     recover_messages,
     sequence_number,
     should_checkpoint,
+    sync_events,
     write_checkpoint,
 )
 from gptme.message import Message
@@ -69,6 +70,16 @@ def test_append_and_read_events(logdir: Path):
     assert len(events) == 2
     assert events[0]["seq"] == 1
     assert events[1]["seq"] == 2
+
+
+def test_sync_events_flushes_existing_event_log(logdir: Path):
+    """A recovery log can be flushed on Windows (requires a writable handle)."""
+    event = {"seq": 1, "ts": "2026-01-01T00:00:00Z", "type": "test", "payload": {}}
+    append_event(logdir, event)
+
+    sync_events(logdir)
+
+    assert read_events(logdir) == [event]
 
 
 def test_event_log_lock_uses_windows_fallback(logdir: Path):

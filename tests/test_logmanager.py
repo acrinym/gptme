@@ -305,6 +305,18 @@ def test_conversation_name_error_rejects_control_and_edge_whitespace(
     assert conversation_name_error(value) == expected
 
 
+def test_write_sync_flushes_transcript_on_windows(tmp_path: Path, monkeypatch):
+    """Synchronous transcript writes must not fsync a read-only Windows handle."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))
+    logdir = tmp_path / "logs" / "sync-conv"
+    manager = LogManager(logdir=logdir, lock=False)
+    manager.append(Message("user", "sync this transcript"))
+
+    manager.write(sync=True)
+
+    assert (logdir / "conversation.jsonl").exists()
+
+
 def test_new_branch_persists_inherited_history(tmp_path: Path, monkeypatch):
     """A new branch writes its inherited prefix to its own destination."""
     monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))

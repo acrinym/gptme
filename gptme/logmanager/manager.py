@@ -666,7 +666,9 @@ class LogManager:
             if trace_path is not None:
                 paths.add(trace_path)
             for path in paths:
-                with path.open("rb") as f:
+                # FlushFileBuffers (used by os.fsync on Windows) requires a
+                # writable file handle. A read-only handle raises errno 9.
+                with path.open("r+b") as f:
                     os.fsync(f.fileno())
             event_dirs = {self.logdir}
             if branches:

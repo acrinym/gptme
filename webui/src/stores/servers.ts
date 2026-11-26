@@ -139,7 +139,14 @@ export function migrateTauriOriginPreset(registry: ServerRegistry): void {
   for (const server of registry.servers) {
     if (!server.isPreset) continue;
     try {
-      if (new URL(server.baseUrl).protocol === 'tauri:') {
+      const parsed = new URL(server.baseUrl);
+      // Tauri's frontend asset origin is platform-dependent: tauri://localhost
+      // on macOS/Linux, and http(s)://tauri.localhost on Windows WebView2.
+      // Neither origin is a gptme-server, so restore the real loopback API.
+      if (
+        parsed.protocol === 'tauri:' ||
+        (['http:', 'https:'].includes(parsed.protocol) && parsed.hostname === 'tauri.localhost')
+      ) {
         server.baseUrl = DEFAULT_SERVER_CONFIG.baseUrl;
       }
     } catch {

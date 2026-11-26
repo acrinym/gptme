@@ -484,7 +484,9 @@ async fn spawn_server_sidecar(
         .sidecar("gptme-server")
         .map_err(|e| format!("Sidecar error: {}", e))?
         .args(&args)
-        .env(SERVER_TOKEN_ENV, token);
+        .env(SERVER_TOKEN_ENV, token)
+        // Set UTF-8 for captured Python output (no interactive console on Windows).
+        .env("PYTHONIOENCODING", "utf-8");
 
     let (mut rx, child) = sidecar_command
         .spawn()

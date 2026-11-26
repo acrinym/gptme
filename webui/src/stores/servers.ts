@@ -139,7 +139,14 @@ export function migrateTauriOriginPreset(registry: ServerRegistry): void {
   for (const server of registry.servers) {
     if (!server.isPreset) continue;
     try {
-      if (new URL(server.baseUrl).protocol === 'tauri:') {
+      const parsed = new URL(server.baseUrl);
+      // Tauri's frontend asset origin is platform-dependent: tauri://localhost
+      // on macOS/Linux, and http(s)://tauri.localhost on Windows WebView2.
+      // Neither origin is a gptme-server, so restore the real loopback API.
+      if (
+        parsed.protocol === 'tauri:' ||
+        (['http:', 'https:'].includes(parsed.protocol) && parsed.hostname === 'tauri.localhost')
+      ) {
         server.baseUrl = DEFAULT_SERVER_CONFIG.baseUrl;
       }
     } catch {
@@ -382,10 +389,16 @@ export function findOrCreateServerByUrl(
 
   if (existing) {
     // Update auth if provided
-    if (defaults?.authToken !== undefined) {
+    if (defaults?.authToken !== undefined || defaults?.sseToken !== undefined) {
       updateServer(existing.id, {
-        authToken: defaults.authToken,
-        useAuthToken: defaults.useAuthToken ?? Boolean(defaults.authToken),
+        ...(defaults?.authToken !== undefined && {
+          authToken: defaults.authToken,
+          useAuthToken: defaults.useAuthToken ?? Boolean(defaults.authToken),
+        }),
+        // Allow null to explicitly clear a previously stored sseToken (e.g. when the
+        // server removes INSTANCE_TOKEN_SECRET and re-auth returns no sseToken).
+        // Only undefined (field absent) is treated as "no change".
+        ...(defaults.sseToken !== undefined && { sseToken: defaults.sseToken }),
       });
     }
     return serverRegistry$.get().servers.find((s) => s.id === existing.id)!;
@@ -398,6 +411,7 @@ export function findOrCreateServerByUrl(
     baseUrl,
     authToken: defaults?.authToken ?? null,
     useAuthToken: defaults?.useAuthToken ?? false,
+    ...(defaults?.sseToken != null && { sseToken: defaults.sseToken }),
   });
 }
 

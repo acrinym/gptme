@@ -9,10 +9,36 @@ gptme provides a pluggable context compression system that allows conversations 
 Overview
 ========
 
-The context compression system has two main components:
+The context compression system has one unified pipeline:
 
-1. **Automatic Compaction** - Triggered when conversations exceed token limits or contain massive tool results
-2. **Plugin Interface** - Allows third-party packages to provide custom compression strategies
+1. **Context Budget** - A configurable token threshold at which compaction is triggered (distinct from the provider window)
+2. **Automatic Compaction** - Triggered after each turn when the log approaches the budget; also retried once on provider context-length overflow
+3. **Plugin Interface** - Allows third-party packages to provide custom compression strategies
+
+The budget defaults to
+``min(0.9 × window, window − max_output − headroom, 256k)``. For a
+200k-window model with 64k maximum output this is 135k; an unvalidated
+1M-window model defaults to 256k. Models proven reliable near their full window
+can opt out through model metadata (Anthropic's native 1M models currently use
+``context_budget = 0.9``). Explicit budgets remain clamped to the output/headroom
+ceiling so they cannot make provider requests overflow.
+
+Configuring the Context Budget
+===============================
+
+The budget can be set at multiple levels (first match wins):
+
+- **CLI**: ``--context-budget 0.85`` (fraction) or
+  ``--context-budget 300000`` (absolute tokens), persisted for that conversation
+- **Environment variable**: ``GPTME_CONTEXT_BUDGET=0.85`` or
+  ``GPTME_CONTEXT_BUDGET=300000``
+- **Per-model user config**: ``[models."deepseek/deepseek-v4"]`` followed by
+  ``context_budget = 300000`` in ``~/.config/gptme/config.toml``
+- **Project/user config**: the existing broad ``[context] budget`` override
+- **Model metadata**: built-in evidence-backed override for validated models
+- **Default**: ``min(0.9 × window, window − max_output − headroom, 256k)``
+
+Note: ``GPTME_CONTEXT_LENGTH`` overrides the *provider window* for local models; ``GPTME_CONTEXT_BUDGET`` controls when compaction fires.
 
 Built-in Compression Strategy
 ==============================
@@ -25,13 +51,17 @@ By default, gptme uses a 3-phase compression algorithm:
 
 This approach intelligently prioritizes the largest messages for removal to achieve target reduction with minimal information loss.
 
-Using the Default Compressor
-=============================
+Using Compaction
+================
 
-When you enable the ``autocompact`` tool, automatic compression is triggered via a post-turn hook:
+Compaction is **enabled by default** — the post-turn hook runs after every turn without needing ``--tool autocompact``. You can also trigger it manually:
 
 .. code-block:: bash
 
+    # Compaction fires automatically; no extra flag needed
+    gptme
+
+    # Still works as an explicit opt-in (no change in behavior)
     gptme --tool autocompact
 
 You can also manually compact a conversation:

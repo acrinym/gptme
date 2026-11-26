@@ -115,14 +115,17 @@ export interface SendMessageRequest extends Message {
 
 // Agent info returned with conversation
 export interface AgentInfo {
-  name: string;
+  // Absent when GPTME_AGENT_COLOR is set but the conversation has no agent project.
+  name?: string;
   avatar?: string;
+  color?: string | null;
 }
 
 // User identity info from global config
 export interface UserInfo {
   name: string;
   avatar?: string;
+  color?: string | null;
 }
 
 // Response from /api/conversations/<logfile>
@@ -176,6 +179,7 @@ export interface ChatConfig {
     temperature?: number | null;
     top_p?: number | null;
     max_tokens?: number | null;
+    context_budget?: number | null;
   };
   env: Record<string, string>;
   mcp: McpConfig;

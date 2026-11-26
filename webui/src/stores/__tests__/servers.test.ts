@@ -201,6 +201,19 @@ describe('migrateTauriOriginPreset', () => {
     expect(registry.servers[0].authToken).toBe('keep-me');
   });
 
+  it.each(['http://tauri.localhost', 'https://tauri.localhost'])(
+    'repairs the Windows WebView2 asset origin %s without losing auth',
+    (baseUrl) => {
+      const registry = makeRegistry([
+        makeServer({ baseUrl, isPreset: true, authToken: 'keep-me', useAuthToken: true }),
+      ]);
+      migrateTauriOriginPreset(registry);
+      expect(registry.servers[0].baseUrl).toBe('http://127.0.0.1:5700');
+      expect(registry.servers[0].authToken).toBe('keep-me');
+      expect(registry.servers[0].useAuthToken).toBe(true);
+    }
+  );
+
   it('leaves healthy presets and user-defined servers alone', () => {
     const registry = makeRegistry([
       makeServer({ baseUrl: 'http://127.0.0.1:5799', isPreset: true }),

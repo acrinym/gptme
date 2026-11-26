@@ -612,6 +612,34 @@ def test_estimate_compaction_savings_tool_results_only_when_over_limit():
     )
 
 
+def test_estimate_compaction_savings_respects_keep_head():
+    """Savings inside the protected keep_head prefix must not be counted.
+
+    The engine never trims messages at ``idx < keep_head``, so counting them in
+    the estimate selects ``rule_based`` for savings the engine cannot realize;
+    the post-hoc savings gate then rejects the view and the log stays over
+    budget (Greptile finding on #4023).
+    """
+    from gptme.tools.autocompact import estimate_compaction_savings
+
+    massive = "x " * 3000  # ~3000 tokens, above max_tool_result_tokens
+    messages = [
+        Message("system", "System prompt"),
+        Message("system", massive),  # idx 1, inside keep_head
+        Message("user", "Request"),
+        Message("assistant", "Response"),
+    ]
+
+    _, savings_kept, _ = estimate_compaction_savings(messages, limit=100, keep_head=2)
+    assert savings_kept == 0, (
+        "kept-head tool results must not count toward estimated savings"
+    )
+
+    # Sanity: the same log reports savings once the head is not protected.
+    _, savings_free, _ = estimate_compaction_savings(messages, limit=100)
+    assert savings_free > 0
+
+
 def test_estimate_compaction_savings_includes_phase3():
     """Test that estimation includes Phase 3 assistant message compression.
 
@@ -643,6 +671,34 @@ def test_estimate_compaction_savings_includes_phase3():
     assert estimated_savings > 0, (
         f"Expected compression savings for long assistant message, got {estimated_savings}"
     )
+
+
+def test_estimate_compaction_savings_includes_phase0():
+    """Phase 0 savings must count so 200–2000 token stale outputs pick rule-based.
+
+    Without this, an over-budget log of mid-size tool results is sent to LLM
+    summarization because Phase 2 only counts outputs above 2000 tokens.
+    """
+    from gptme.tools.autocompact import (
+        estimate_compaction_savings,
+        should_auto_compact,
+    )
+
+    stale = "word " * 400  # ~400 tokens, below Phase 2's 2000-token cutoff
+    messages: list[Message] = [Message("user", "start")]
+    for i in range(12):
+        messages.append(
+            Message("system", stale, datetime.now(tz=timezone.utc), call_id=f"call-{i}")
+        )
+        messages.append(Message("user", f"next {i}"))
+    messages.extend(Message("user", f"recent {i}") for i in range(5))
+
+    total, savings, _ = estimate_compaction_savings(messages, limit=100)
+    assert savings > 0, "Phase 0 must contribute savings for mid-size stale outputs"
+    # Savings should be a meaningful fraction, not a rounding crumb.
+    assert savings / total > 0.10
+
+    assert should_auto_compact(messages, limit=100) == "rule_based"
 
 
 def test_should_auto_compact_respects_minimum_savings():
@@ -906,6 +962,92 @@ def test_load_context_files_truncates_long_files(tmp_path):
     assert "truncated" in loaded[0][1].lower()
 
 
+def test_load_context_files_rejects_paths_outside_workspace(tmp_path):
+    """Summarizer-suggested paths must not escape the workspace."""
+    from gptme.tools.autocompact import _load_context_files
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "ok.py").write_text("print('ok')")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET")
+
+    loaded = _load_context_files(
+        [
+            "ok.py",
+            str(secret),
+            "../secret.txt",
+            "~/.ssh/id_rsa",
+            "/etc/passwd",
+        ],
+        workspace=workspace,
+    )
+    assert [path for path, _ in loaded] == ["ok.py"]
+    assert "SECRET" not in "".join(content for _, content in loaded)
+
+
+def test_load_context_files_allows_absolute_path_inside_workspace(tmp_path):
+    """Absolute paths are fine when they resolve inside the workspace."""
+    from gptme.tools.autocompact import _load_context_files
+
+    target = tmp_path / "inside.py"
+    target.write_text("inside")
+    loaded = _load_context_files([str(target)], workspace=tmp_path)
+    assert len(loaded) == 1
+    assert "inside" in loaded[0][1]
+
+
+def test_load_context_files_rejects_symlink_escape(tmp_path):
+    """Symlinks that resolve outside the workspace must not be read."""
+    from gptme.tools.autocompact import _load_context_files
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET")
+    link = workspace / "link.txt"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlink not permitted")
+
+    loaded = _load_context_files(["link.txt"], workspace=workspace)
+    assert loaded == []
+
+
+def test_should_auto_compact_uses_budget_for_massive_tool_result_threshold():
+    """A massive tool result below the configured budget must not trigger."""
+    messages = [Message("system", "x " * 2500)]
+
+    assert should_auto_compact(messages, limit=100_000) == "none"
+
+
+def test_auto_compact_trims_at_exact_budget(monkeypatch):
+    """Decision and engine use the same inclusive budget boundary.
+
+    Token counts must be mocked for every equivalent list, not just the
+    original ``messages`` object — the engine copies into ``compacted_log``.
+    """
+    messages = [Message("system", "tool output " * 100)]
+    from gptme.tools.autocompact import engine
+
+    def fake_len_tokens(value, model=None):
+        if isinstance(value, list):
+            return sum(fake_len_tokens(item, model) for item in value)
+        content = value.content if isinstance(value, Message) else value
+        if isinstance(content, str) and content.startswith("tool output"):
+            return 5000
+        return 50
+
+    monkeypatch.setattr(engine, "len_tokens", fake_len_tokens)
+
+    compacted = list(
+        auto_compact_log(messages, limit=5000, max_tool_result_tokens=2000)
+    )
+
+    assert compacted[0].content != messages[0].content
+
+
 def test_should_auto_compact_returns_summarize_when_over_limit_low_savings():
     """Test that should_auto_compact returns 'summarize' when over limit but rule-based savings are too low."""
     # Many short user messages: over a low limit but nothing to rule-based compact
@@ -1000,6 +1142,159 @@ def test_resume_via_llm_with_view_branch():
     # Status messages should be hidden
     for msg in results:
         assert msg.hide is True
+
+
+def test_resume_via_llm_unlocks_during_provider_call():
+    """Summarization must drop a held conversation lock around llm.reply."""
+    import threading
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock, patch
+
+    from gptme.tools.autocompact import _resume_via_llm
+
+    mock_manager = MagicMock()
+    mock_manager.workspace = None
+    mock_manager.logdir = None
+    mock_manager.current_view = None
+    messages = [
+        Message("system", "System prompt"),
+        Message("user", "User message 1"),
+        Message("assistant", "Assistant response 1"),
+        Message("user", "User message 2"),
+        Message("assistant", "Assistant response 2"),
+    ]
+    mock_manager.log.messages = messages
+    mock_manager.get_next_view_name.return_value = "view-1"
+
+    lock = threading.RLock()
+    lock.acquire()
+    unlocked_during_reply: list[bool] = []
+
+    def fake_reply(*args, **kwargs):
+        contended = threading.Event()
+
+        def probe() -> None:
+            got = lock.acquire(blocking=False)
+            if got:
+                lock.release()
+            else:
+                contended.set()
+
+        probe_thread = threading.Thread(target=probe)
+        probe_thread.start()
+        probe_thread.join(timeout=5)
+        unlocked_during_reply.append(not contended.is_set())
+        mock_response = MagicMock()
+        mock_response.content = "# Resume\n## Summary\nDone.\n"
+        return mock_response
+
+    @contextmanager
+    def released():
+        lock.release()
+        try:
+            yield
+        finally:
+            lock.acquire()
+
+    with (
+        patch("gptme.tools.autocompact.resume.llm") as mock_llm,
+        patch("gptme.tools.autocompact.resume.get_default_model") as mock_model,
+    ):
+        mock_llm.reply.side_effect = fake_reply
+        mock_m = MagicMock()
+        mock_m.full = "test-model"
+        mock_model.return_value = mock_m
+        list(
+            _resume_via_llm(
+                mock_manager,
+                messages,
+                use_view_branch=True,
+                llm_unlocked=released(),
+            )
+        )
+
+    assert unlocked_during_reply == [True]
+    reacquired = threading.Event()
+
+    def probe_after() -> None:
+        got = lock.acquire(blocking=False)
+        if got:
+            lock.release()
+        else:
+            reacquired.set()
+
+    after_thread = threading.Thread(target=probe_after)
+    after_thread.start()
+    after_thread.join(timeout=5)
+    assert reacquired.is_set()
+    lock.release()
+
+
+def test_resume_via_llm_discards_stale_result_after_unlock():
+    """Do not apply a summary if the conversation moved during llm.reply."""
+    import threading
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock, patch
+
+    from gptme.tools.autocompact import _resume_via_llm
+
+    mock_manager = MagicMock()
+    mock_manager.workspace = None
+    mock_manager.logdir = None
+    mock_manager.current_view = None
+    mock_manager.log.messages = [
+        Message("system", "System prompt"),
+        Message("user", "User message 1"),
+        Message("assistant", "Assistant response 1"),
+    ]
+    mock_manager.get_next_view_name.return_value = "view-1"
+
+    messages = list(mock_manager.log.messages) + [
+        Message("user", "User message 2"),
+        Message("assistant", "Assistant response 2"),
+    ]
+
+    lock = threading.RLock()
+    lock.acquire()
+
+    def fake_reply(*args, **kwargs):
+        mock_manager.current_view = "compacted-001"
+        mock_manager.log.messages = mock_manager.log.messages + [
+            Message("system", "tool result arrived during summary")
+        ]
+        mock_response = MagicMock()
+        mock_response.content = "# Resume\n## Summary\nStale.\n"
+        return mock_response
+
+    @contextmanager
+    def released():
+        lock.release()
+        try:
+            yield
+        finally:
+            lock.acquire()
+
+    with (
+        patch("gptme.tools.autocompact.resume.llm") as mock_llm,
+        patch("gptme.tools.autocompact.resume.get_default_model") as mock_model,
+    ):
+        mock_llm.reply.side_effect = fake_reply
+        mock_m = MagicMock()
+        mock_m.full = "test-model"
+        mock_model.return_value = mock_m
+        results = list(
+            _resume_via_llm(
+                mock_manager,
+                messages,
+                use_view_branch=True,
+                llm_unlocked=released(),
+            )
+        )
+
+    mock_manager.create_view.assert_not_called()
+    mock_manager.switch_view.assert_not_called()
+    assert any("stale" in msg.content.lower() for msg in results)
+    lock.release()
 
 
 def test_keep_head_protects_head_messages_from_reasoning_strip():
@@ -1216,7 +1511,7 @@ def test_autocompact_hook_honors_keep_head(monkeypatch):
     mock_manager.logdir = MagicMock()
     mock_manager.log.messages = msgs
     # Reset rate-limiting timer so the hook doesn't short-circuit
-    hook_module._last_autocompact_time = 0
+    hook_module._last_autocompact_attempt.clear()
 
     captured_keep_head: dict = {}
     mock_provider = MagicMock()
@@ -1258,6 +1553,143 @@ def test_autocompact_hook_honors_keep_head(monkeypatch):
     assert captured_keep_head.get("value") == 3, (
         f"Expected keep_head=3 from env override, got {captured_keep_head.get('value')}; "
         "hook.py must call _get_keep_head() and pass it as CompressionConfig.keep_head"
+    )
+
+
+def test_autocompact_throttle_is_per_conversation(monkeypatch):
+    """A compact on one conversation must not skip a sibling's budget check."""
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.hook import autocompact_hook
+
+    hook_module._last_autocompact_attempt.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    def make_manager(logdir: str, n: int = 3) -> MagicMock:
+        manager = MagicMock()
+        manager.logdir = logdir
+        manager.log.messages = [Message("user", f"m{i}") for i in range(n)]
+        return manager
+
+    first = make_manager("/tmp/conv-a")
+    second = make_manager("/tmp/conv-b")
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="none",
+        ) as should_compact,
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+    ):
+        # First conversation records no attempt because action is none, so
+        # seed the guard as if it just compacted.
+        hook_module._last_autocompact_attempt[
+            (str(first.logdir), first.current_branch)
+        ] = (
+            time.time(),
+            len(first.log.messages),
+        )
+        list(autocompact_hook(second))
+
+    assert should_compact.called, (
+        "Sibling conversation must still run should_auto_compact "
+        "while another conversation is inside the reentrancy window"
+    )
+
+
+def test_autocompact_throttle_allows_retry_when_log_grows(monkeypatch):
+    """Tool results appended inside the interval must not be skipped."""
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.hook import autocompact_hook
+
+    hook_module._last_autocompact_attempt.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-grow"
+    manager.log.messages = [Message("user", "one"), Message("assistant", "two")]
+    manager.current_branch = "main"
+    hook_module._last_autocompact_attempt[
+        (str(manager.logdir), manager.current_branch)
+    ] = (
+        time.time(),
+        2,
+    )
+    manager.log.messages = [
+        Message("user", "one"),
+        Message("assistant", "two"),
+        Message("system", "huge tool result"),
+    ]
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="none",
+        ) as should_compact,
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+    ):
+        list(autocompact_hook(manager))
+
+    assert should_compact.called
+
+
+def test_autocompact_throttle_allows_retry_after_failed_compaction(monkeypatch):
+    """Failed compaction must not suppress retry for the same message count.
+
+    Regression: before the fix, _last_autocompact_attempt was recorded before
+    provider.compress() ran. A compress() exception left the record set, so the
+    next call with the same conversation and message count was throttled for 60s
+    even though no compaction had succeeded.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.hook import autocompact_hook
+
+    hook_module._last_autocompact_attempt.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [Message("user", f"m{i}") for i in range(3)]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-fail-retry"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+
+    mock_provider = MagicMock()
+    mock_provider.compress.side_effect = RuntimeError("provider down")
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="rule_based",
+        ) as should_compact,
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+    ):
+        # First call — compress() raises; hook must swallow the exception
+        list(autocompact_hook(manager))
+
+        # Attempt must NOT be recorded for a failed compaction
+        conv_key = (str(manager.logdir), manager.current_branch)
+        assert conv_key not in hook_module._last_autocompact_attempt, (
+            "A failed compaction must not populate _last_autocompact_attempt; "
+            "the retry window should remain open"
+        )
+
+        should_compact.reset_mock()
+
+        # Second call with identical messages — must NOT be throttled
+        list(autocompact_hook(manager))
+
+    assert should_compact.called, (
+        "should_auto_compact must be called on retry after a failed compaction "
+        "with unchanged message count — no premature throttle should apply"
     )
 
 
@@ -1536,7 +1968,7 @@ def test_manual_trim_writes_compaction_event(tmp_path, monkeypatch):
     compacted = manager.log.messages[:2]
     monkeypatch.setattr(
         "gptme.tools.autocompact.handlers.should_auto_compact",
-        lambda _msgs: "rule_based",
+        lambda _msgs, **_kw: "rule_based",
     )
     provider = MagicMock()
     provider.compress.return_value.messages = compacted
@@ -1631,3 +2063,1201 @@ def test_compact_trim_handler_honors_env_keep_head(monkeypatch):
     assert captured_keep_head.get("value") == 7, (
         f"Expected keep_head=7 from env override, got {captured_keep_head.get('value')}"
     )
+
+
+def test_cli_post_tool_compaction_appends_hook_messages(monkeypatch):
+    """The CLI chat loop must run compaction after tool results, like the server.
+
+    Regression test: TURN_POST fires only after the final assistant message of
+    a turn, so a large tool result appended mid-turn used to ride the
+    continuation request past the context budget with only limit_log as a
+    last-resort guard. The CLI now mirrors the server's
+    _compact_after_tool_results between steps.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from gptme.chat import _run_post_tool_compaction
+    from gptme.hooks import StopPropagation
+    from gptme.message import Message
+
+    manager = MagicMock()
+    appended: list = []
+    manager.append.side_effect = appended.append
+
+    hook_msgs = [
+        Message("system", "compaction notice"),
+        StopPropagation(),
+        Message("system", "after stop"),
+    ]
+
+    with patch(
+        "gptme.tools.autocompact.hook.autocompact_hook",
+        return_value=iter(hook_msgs),
+    ):
+        _run_post_tool_compaction(manager)
+
+    assert [m.content for m in appended] == ["compaction notice", "after stop"], (
+        "The StopPropagation sentinel itself must not be appended to the log "
+        "(matching the server's _compact_after_tool_results behavior)"
+    )
+
+
+def test_cli_post_tool_compaction_swallows_hook_errors(monkeypatch):
+    """A compaction failure must not kill the CLI chat loop."""
+    from unittest.mock import MagicMock, patch
+
+    from gptme.chat import _run_post_tool_compaction
+
+    manager = MagicMock()
+
+    with patch(
+        "gptme.tools.autocompact.hook.autocompact_hook",
+        side_effect=RuntimeError("boom"),
+    ):
+        # Must not raise
+        _run_post_tool_compaction(manager)
+
+    manager.append.assert_not_called()
+
+
+def test_cli_post_tool_compaction_reports_view_switch():
+    """_run_post_tool_compaction must report whether the view was switched.
+
+    Regression test (Greptile P1): when compaction replaces the active view
+    mid-turn, the resumed log ends with the summary resume instead of the
+    assistant's tool call, so the chat loop's content-based continuation check
+    would end the turn without making the continuation request. The loop
+    relies on this return value to keep the pre-compaction decision.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from gptme.chat import _run_post_tool_compaction
+
+    manager = MagicMock()
+    manager.current_view = "view-a"
+
+    # No compaction (hook yields nothing): same view → False
+    with patch("gptme.tools.autocompact.hook.autocompact_hook", return_value=iter([])):
+        assert _run_post_tool_compaction(manager) is False
+
+    # Compaction switches the view → True
+    def switching_hook(manager):
+        manager.current_view = "view-b"
+        return iter([])
+
+    with patch(
+        "gptme.tools.autocompact.hook.autocompact_hook", side_effect=switching_hook
+    ):
+        assert _run_post_tool_compaction(manager) is True
+
+
+def test_has_pending_tooluse_detects_runnable_tool_call():
+    from gptme.chat import _has_pending_tooluse
+    from gptme.logmanager import Log
+    from gptme.message import Message
+
+    log = Log(
+        [
+            Message("user", "run this"),
+            Message("assistant", "```shell\necho hi\n```"),
+        ]
+    )
+    assert _has_pending_tooluse(log) is True
+
+    log_plain = Log(
+        [
+            Message("user", "hi"),
+            Message("assistant", "All done, nothing left to run."),
+        ]
+    )
+    assert _has_pending_tooluse(log_plain) is False
+
+
+# --- Phase 1.5a safety fixes (gptme/gptme#3812) ---
+
+
+def test_pending_tool_guard_ignores_ui_only_messages():
+    """UI-only status messages must not count as tool results (Phase 1.5a).
+
+    A hook notice between the tool call and its result previously satisfied the
+    markdown fallback count, letting compaction orphan the pending result.
+    """
+    from gptme.tools.autocompact.hook import _has_pending_tool_calls
+
+    msgs = [
+        Message("user", "run this"),
+        Message("assistant", "```shell\necho hi\n```"),
+        Message("system", "hook notice", ui_only=True),
+    ]
+    assert _has_pending_tool_calls(msgs) is True
+
+    # With the real result present, the call is answered even with UI-only
+    # noise in between.
+    msgs_answered = [
+        Message("user", "run this"),
+        Message("assistant", "```shell\necho hi\n```"),
+        Message("system", "hook notice", ui_only=True),
+        Message("system", "Ran shell command"),
+    ]
+    assert _has_pending_tool_calls(msgs_answered) is False
+
+
+def test_pending_tool_guard_ignores_intervening_user_messages():
+    """A user turn between a markdown tool call and its result is not an answer.
+
+    The markdown fallback counts system result messages, not "any non-ui_only
+    message". A user interrupt/follow-up would otherwise satisfy
+    ``len(results) >= len(calls)`` and let compaction orphan the pending result.
+    """
+    from gptme.tools.autocompact.hook import _has_pending_tool_calls
+
+    msgs = [
+        Message("user", "run this"),
+        Message("assistant", "```shell\necho hi\n```"),
+        Message("user", "wait, actually don't"),
+    ]
+    assert _has_pending_tool_calls(msgs) is True
+
+    msgs_answered = [
+        Message("user", "run this"),
+        Message("assistant", "```shell\necho hi\n```"),
+        Message("user", "wait, actually don't"),
+        Message("system", "Ran shell command"),
+    ]
+    assert _has_pending_tool_calls(msgs_answered) is False
+
+
+def test_auto_compact_does_not_strip_reasoning_by_default():
+    """Age-based reasoning stripping must be off by default (Phase 1.5a).
+
+    Stripping edits the provider-visible prefix before retained signed thinking
+    blocks, invalidating Anthropic signatures and dropping DeepSeek/Kimi
+    ``reasoning_content`` on retained tool turns.
+    """
+    msgs = [
+        Message(
+            "user",
+            f"message {i} <think>old reasoning {i}</think>",
+            datetime.now(tz=timezone.utc),
+        )
+        for i in range(8)
+    ]
+
+    # Force the compaction path. Without a low limit, 8 short messages sit
+    # under the default 80% context budget and early-return unchanged — the
+    # test would pass even if default stripping were still enabled.
+    compacted = list(auto_compact_log(msgs, limit=1))
+
+    assert all("<think>" in m.content for m in compacted), (
+        "Default compaction must not strip reasoning; pass "
+        "reasoning_strip_age_threshold to opt in"
+    )
+
+    # Opting in restores the old behavior.
+    opted_in = list(auto_compact_log(msgs, limit=1, reasoning_strip_age_threshold=2))
+    assert any("<think>" not in m.content for m in opted_in)
+
+
+def test_compress_content_preserves_think_blocks_verbatim():
+    """compress_content must treat inline reasoning as opaque text."""
+    from gptme.tools.autocompact.scoring import compress_content
+
+    think = "<think>step one. step two. step three. signature-critical</think>"
+    body = ". ".join(f"Sentence number {i} about the task" for i in range(20))
+    content = f"{body}. {think} A final sentence."
+
+    compressed = compress_content(content, target_ratio=0.5)
+
+    assert think in compressed, (
+        "Think block must survive compression byte-for-byte; rewriting it "
+        "destroys the provider signature"
+    )
+
+
+def test_no_compaction_with_pending_tool_calls(monkeypatch):
+    """Never compact while the last assistant message has unanswered tool calls."""
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", "do the thing"),
+        Message("assistant", "```shell\necho hi\n```"),  # pending tool call
+    ]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-pending-tools"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ),
+        patch("gptme.tools.autocompact.hook._resume_via_llm") as mock_resume,
+    ):
+        list(hook_module.autocompact_hook(manager))
+
+    assert not mock_resume.called, "Must not compact with pending tool calls"
+
+
+def test_reasoning_strip_and_tool_guard_are_not_run_when_not_pending(monkeypatch):
+    """Sanity: with the tool result present the guard no longer blocks recovery."""
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", "do the thing"),
+        Message("assistant", "```shell\necho hi\n```"),
+        Message("system", "hi"),  # tool result answers the call
+    ]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-answered-tools"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ) as should_compact,
+        patch(
+            "gptme.tools.autocompact.hook._resume_via_llm",
+            side_effect=lambda m, messages, **kw: iter([]),
+        ) as mock_resume,
+    ):
+        list(hook_module.autocompact_hook(manager))
+
+    assert should_compact.called
+    assert mock_resume.called
+
+
+def test_failed_summarize_latches_to_trim(monkeypatch):
+    """A rejected summarize must fall back to trim, not retry every tool step."""
+    import hashlib
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.context_provider import CompactionResult
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [Message("user", f"m{i}") for i in range(5)]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-latch"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    def rejected_resume(manager, messages, **kwargs):
+        # Yield a status message but do not switch views (a rejected summarize).
+        yield Message("system", "Generating...", hide=True, ui_only=True)
+
+    mock_provider = MagicMock()
+    mock_provider.compress.side_effect = lambda messages, config: CompactionResult(
+        messages=list(messages),
+        source_digest=hashlib.sha256(b"test").hexdigest(),
+        covered_through=len(messages) - 1,
+    )
+
+    conv_key = ("/tmp/conv-latch", "master")
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook._resume_via_llm",
+            side_effect=rejected_resume,
+        ) as mock_resume,
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+        patch("gptme.tools.autocompact.hook.trigger_hook", return_value=iter([])),
+    ):
+        # 1. A rejected summarize sets the latch (no trim this step).
+        list(hook_module.autocompact_hook(manager))
+        assert conv_key in hook_module._failed_summarize
+        assert not mock_provider.compress.called
+        mock_resume.reset_mock()
+        mock_provider.reset_mock()
+
+        # 2. Latched -> trim-only: summarize skipped, trim runs.
+        list(hook_module.autocompact_hook(manager))
+        assert not mock_resume.called, "Latch must suppress the summarize retry"
+        assert mock_provider.compress.called, "Latch must fall back to trim"
+
+
+def test_failed_summarize_latch_releases_after_growth(monkeypatch):
+    """The latch releases once the conversation has grown enough to retry."""
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    conv_key = ("/tmp/conv-latch-growth", "master")
+    n_before = 5
+    msgs = [
+        Message("user", f"m{i}")
+        for i in range(n_before + hook_module._FAILURE_RETRY_GROWTH_MESSAGES)
+    ]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-latch-growth"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+    # Pre-seed a latch from the earlier failure.
+    hook_module._failed_summarize[conv_key] = n_before
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook._resume_via_llm",
+            side_effect=lambda m, messages, **kw: iter([]),
+        ) as mock_resume,
+    ):
+        list(hook_module.autocompact_hook(manager))
+
+    assert mock_resume.called, "Latch must release after enough growth"
+
+
+def test_no_compaction_with_partial_tool_results(monkeypatch):
+    """A partial result set (some tools still pending) must still block compaction."""
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", "run both"),
+        Message(
+            "assistant",
+            "```shell\necho one\n```\n```shell\necho two\n```",
+        ),
+        Message("system", "one"),  # only one of two results has arrived
+    ]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-partial-tools"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ),
+        patch("gptme.tools.autocompact.hook._resume_via_llm") as mock_resume,
+    ):
+        list(hook_module.autocompact_hook(manager))
+
+    assert not mock_resume.called, "Must not compact while one tool result is missing"
+
+
+def test_hook_status_messages_do_not_count_as_growth(monkeypatch):
+    """Hook-yielded UI-only messages must not defeat the effective-count throttle."""
+    from gptme.tools.autocompact.hook import _effective_message_count
+
+    msgs = [Message("user", "hi"), Message("assistant", "ok")]
+    statuses = [Message("system", "status", ui_only=True) for _ in range(5)]
+    assert _effective_message_count(msgs + statuses) == len(msgs)
+
+
+def test_rule_based_status_message_is_ui_only(monkeypatch):
+    """The rule-based success notice must be UI-only (not sent to the provider)."""
+    import hashlib
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", "word " * 200),
+        Message("system", "tool result " * 200),
+    ]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-ui-only"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    from gptme.tools.autocompact.context_provider import CompactionResult
+
+    mock_provider = MagicMock()
+    mock_provider.compress.side_effect = lambda messages, config: CompactionResult(
+        messages=list(messages),
+        source_digest=hashlib.sha256(b"test").hexdigest(),
+        covered_through=len(messages) - 1,
+    )
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="rule_based",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+        patch("gptme.tools.autocompact.hook.trigger_hook", return_value=iter([])),
+    ):
+        yielded = list(hook_module.autocompact_hook(manager))
+
+    notices = [m for m in yielded if isinstance(m, Message)]
+    assert notices, "Expected a status message from the rule-based path"
+    assert all(m.ui_only for m in notices), "Status messages must be ui_only"
+
+
+def test_ui_only_is_excluded_from_provider_context():
+    """prepare_messages drops ui_only messages from the provider-visible stream."""
+    from gptme.logmanager import prepare_messages
+
+    msgs = [
+        Message("user", "hello"),
+        Message("system", "🔄 Generating conversation resume...", ui_only=True),
+        Message("assistant", "hi"),
+    ]
+
+    prepared = prepare_messages(msgs)
+
+    assert all(not m.ui_only for m in prepared)
+    assert "Generating conversation resume" not in "".join(m.content for m in prepared)
+
+
+def test_ui_only_round_trips_through_json(tmp_path):
+    """ui_only must persist to/from the log so it survives a resume."""
+    import json
+
+    from gptme.logmanager.manager import _gen_read_jsonl
+    from gptme.message import Message
+
+    msg = Message("system", "status", ui_only=True)
+    assert msg.to_dict().get("ui_only") is True
+
+    logfile = tmp_path / "conversation.jsonl"
+    logfile.write_text(json.dumps(msg.to_dict()) + "\n")
+
+    reloaded = list(_gen_read_jsonl(logfile))
+    assert len(reloaded) == 1
+    assert reloaded[0].ui_only is True
+
+
+def test_ui_only_false_is_omitted_from_json():
+    """Default messages must not gain a ui_only key (keeps logs unchanged)."""
+    from gptme.message import Message
+
+    assert "ui_only" not in Message("user", "hi").to_dict()
+
+
+def test_estimate_excludes_think_bearing_assistant_messages():
+    """The Phase 3 estimate must skip think-bearing messages, matching the engine.
+
+    Otherwise the hook can repeatedly choose rule-based compaction and create
+    views that never achieve the estimated savings.
+    """
+    from gptme.tools.autocompact import estimate_compaction_savings
+
+    long_think = "<think>" + ("reasoning " * 2000) + "</think>"
+    msgs = [
+        Message("user", "req"),
+        Message("assistant", long_think),
+        Message("user", "req2"),
+        Message("assistant", "ok"),
+    ]
+
+    _total, savings, _reasoning = estimate_compaction_savings(
+        msgs,
+        limit=100,  # Force over-limit so Phase 3 would otherwise count
+        assistant_compression_age_threshold=2,
+    )
+
+    assert savings == 0, (
+        "Think-bearing assistant messages are skipped by the engine and must not "
+        "count toward estimated compression savings"
+    )
+
+
+def test_failed_summarize_latch_survives_ineffective_trim(monkeypatch):
+    """A trim while latched must not clear the latch and reset the growth clock.
+
+    Otherwise an ineffective trim (still over budget) lets summarize retry and
+    fail again every 20 messages, creating repeated expensive attempts and
+    throwaway views.
+    """
+    import hashlib
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.context_provider import CompactionResult
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [Message("user", f"m{i}") for i in range(5)]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-latch-trim-survives"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    mock_provider = MagicMock()
+    mock_provider.compress.side_effect = lambda messages, config: CompactionResult(
+        messages=list(messages),  # trim achieves nothing
+        source_digest=hashlib.sha256(b"test").hexdigest(),
+        covered_through=len(messages) - 1,
+    )
+
+    conv_key = ("/tmp/conv-latch-trim-survives", "master")
+    hook_module._failed_summarize[conv_key] = 0
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+        patch("gptme.tools.autocompact.hook.trigger_hook", return_value=iter([])),
+    ):
+        list(hook_module.autocompact_hook(manager))
+
+    assert mock_provider.compress.called, "Latched summarize must trim"
+    assert conv_key in hook_module._failed_summarize, (
+        "An ineffective trim must not clear the failure latch"
+    )
+
+
+def test_failed_summarize_latch_rebases_after_trim(monkeypatch):
+    """Growth is measured from the post-trim view, so the latch can still lift."""
+    import hashlib
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.context_provider import CompactionResult
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [Message("user", f"m{i}") for i in range(30)]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-rebase"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    trimmed = [Message("user", "summary")]
+
+    def create_view(_name, compacted):
+        manager.log.messages = list(compacted)
+
+    manager.create_view.side_effect = create_view
+
+    mock_provider = MagicMock()
+    mock_provider.compress.side_effect = lambda messages, config: CompactionResult(
+        messages=list(trimmed),
+        source_digest=hashlib.sha256(b"t").hexdigest(),
+        covered_through=0,
+    )
+
+    def rejected_resume(manager, messages, **kwargs):
+        yield Message("system", "Generating...", hide=True, ui_only=True)
+
+    conv_key = ("/tmp/conv-rebase", "master")
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook._resume_via_llm",
+            side_effect=rejected_resume,
+        ) as mock_resume,
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+        patch("gptme.tools.autocompact.hook.trigger_hook", return_value=iter([])),
+    ):
+        # 1. A rejected summarize latches at the current count (30).
+        list(hook_module.autocompact_hook(manager))
+        assert hook_module._failed_summarize[conv_key] == 30
+        mock_resume.reset_mock()
+
+        # 2. Latched -> trim; the latch must rebase to the post-trim view (1).
+        list(hook_module.autocompact_hook(manager))
+        assert not mock_resume.called
+        assert hook_module._failed_summarize[conv_key] == 1, (
+            "Latch must rebase to the post-trim count, or it can never lift"
+        )
+
+        # 3. Growth >= threshold since the post-trim view releases the latch.
+        manager.log.messages = trimmed + [
+            Message("user", f"g{i}")
+            for i in range(hook_module._FAILURE_RETRY_GROWTH_MESSAGES)
+        ]
+        list(hook_module.autocompact_hook(manager))
+        assert mock_resume.called, "Latch must lift after growth measured post-trim"
+
+
+def test_failed_summarize_latch_baseline_never_moves_up(monkeypatch):
+    """A count-preserving trim must not advance the latch baseline.
+
+    Otherwise repeated trims each reset the growth clock and summarize is never
+    retried (and each step creates another view).
+    """
+    import hashlib
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.context_provider import CompactionResult
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-baseline"
+    manager.current_branch = "master"
+    manager.current_view = "main"
+
+    def set_msgs(n):
+        manager.log.messages = [Message("user", f"m{i}") for i in range(n)]
+
+    def create_view(_name, compacted):
+        manager.log.messages = list(compacted)
+
+    manager.create_view.side_effect = create_view
+
+    # A trim that preserves the message count (content truncation only).
+    mock_provider = MagicMock()
+    mock_provider.compress.side_effect = lambda messages, config: CompactionResult(
+        messages=list(messages),
+        source_digest=hashlib.sha256(b"same").hexdigest(),
+        covered_through=len(messages) - 1,
+    )
+
+    def rejected_resume(manager, messages, **kwargs):
+        yield Message("system", "Generating...", hide=True, ui_only=True)
+
+    conv_key = ("/tmp/conv-baseline", "master")
+    threshold = hook_module._FAILURE_RETRY_GROWTH_MESSAGES
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="summarize",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook._resume_via_llm",
+            side_effect=rejected_resume,
+        ) as mock_resume,
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        patch("gptme.tools.autocompact.hook.get_default_model", return_value=None),
+        patch("gptme.tools.autocompact.hook.trigger_hook", return_value=iter([])),
+    ):
+        # Latch at 30.
+        set_msgs(30)
+        list(hook_module.autocompact_hook(manager))
+        assert hook_module._failed_summarize[conv_key] == 30
+
+        # A count-preserving trim at 35 must NOT move the baseline up.
+        set_msgs(35)
+        list(hook_module.autocompact_hook(manager))
+        assert hook_module._failed_summarize[conv_key] == 30, (
+            "Count-preserving trim must not advance the latch baseline"
+        )
+
+        # Growth from 30 still accumulates: 50 - 30 = 20 releases the latch.
+        set_msgs(30 + threshold)
+        list(hook_module.autocompact_hook(manager))
+        assert mock_resume.called, (
+            "Latch must release once real growth reaches threshold"
+        )
+
+
+def _big_plain_system_result(n_words: int) -> Message:
+    """A large plain ``system`` message that Phase 2 (not Phase 0) will trim.
+
+    Phase 0 only stubs *tool* outputs (``call_id`` or directly after a
+    tool-call assistant message), so a plain system message is ignored by the
+    pre-pass and handled by the Phase 2 largest-first loop.
+    """
+    words = " ".join(f"tok{i}" for i in range(n_words))
+    return Message(
+        "system",
+        f"Ran command: `find /usr -type f`\n{words}",
+        datetime.now(tz=timezone.utc),
+    )
+
+
+def test_auto_compact_log_target_ratio_leaves_headroom():
+    """Hysteresis: ``target_ratio`` trims below the trigger, not to it.
+
+    Phase 1.5b: a trim that stops as soon as it is under the budget re-triggers
+    on the next step. With three equal massive results and a limit of 2.2x one
+    result, the default (ratio 1.0) stops after removing one (~2 results left);
+    ratio 0.7 must remove a second result to reach its target.
+    """
+    from gptme.tools.autocompact import TRIM_TARGET_RATIO
+
+    model = get_default_model() or get_model("gpt-4")
+    results = [_big_plain_system_result(20000) for _ in range(3)]
+    msgs = [
+        Message("user", "list files", datetime.now(tz=timezone.utc)),
+        Message("assistant", "ok", datetime.now(tz=timezone.utc)),
+        *results,
+    ]
+    one_result_tokens = len_tokens(results[0].content, model.model)
+    limit = int(2.2 * one_result_tokens)
+
+    default = list(auto_compact_log(msgs, limit=limit))
+    default_tokens = len_tokens(default, model.model)
+    # Default lands under the trigger but without headroom above the target.
+    assert default_tokens > int(TRIM_TARGET_RATIO * limit), (
+        "precondition: default trim should not already be below the 0.7 target"
+    )
+
+    hysteretic = list(
+        auto_compact_log(msgs, limit=limit, target_ratio=TRIM_TARGET_RATIO)
+    )
+    hysteretic_tokens = len_tokens(hysteretic, model.model)
+    assert hysteretic_tokens <= int(TRIM_TARGET_RATIO * limit), (
+        f"target_ratio={TRIM_TARGET_RATIO} should trim below the target "
+        f"({hysteretic_tokens} > {int(TRIM_TARGET_RATIO * limit)})"
+    )
+    assert hysteretic_tokens < default_tokens, (
+        "hysteretic trim must remove more than the default"
+    )
+
+
+def test_hook_rejects_view_below_min_savings(monkeypatch):
+    """Phase 1.5b: never install a view that fails the actual savings gate."""
+    import hashlib
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.context_provider import CompactionResult
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    msgs = [
+        Message("system", "System prompt " * 50),
+        Message("user", "do the thing " * 50),
+        Message("system", "result " * 50),
+    ]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-savings-gate"
+    manager.current_branch = "master"
+    manager.log.messages = msgs
+    manager.current_view = "main"
+
+    mock_provider = MagicMock()
+
+    def fake_compress(messages, config):
+        # Returns the log essentially unchanged: ~0% savings.
+        return CompactionResult(
+            messages=list(messages),
+            source_digest=hashlib.sha256(b"same").hexdigest(),
+            covered_through=len(messages) - 1,
+        )
+
+    mock_provider.compress.side_effect = fake_compress
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="rule_based",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        # Pin the model so the savings gate is actually exercised regardless of
+        # the ambient environment (with no default model the gate fails open).
+        patch(
+            "gptme.tools.autocompact.hook.get_default_model",
+            return_value=get_model("gpt-4"),
+        ),
+        # The rejection must fall back to the LLM summarizer instead of leaving
+        # the over-budget log uncompacted until a provider overflow.
+        patch(
+            "gptme.tools.autocompact.hook._resume_via_llm",
+            return_value=iter([]),
+        ) as mock_resume,
+    ):
+        list(hook_module.autocompact_hook(manager))
+
+    assert not manager.create_view.called, (
+        "a view saving <MIN_SAVINGS_RATIO must be rejected, not installed"
+    )
+    # The rejected attempt is recorded so the unchanged log does not re-fire.
+    assert (str(manager.logdir), "master") in hook_module._last_autocompact_attempt
+    # Recovery: the summarizer is tried so an over-budget log is not wedged.
+    mock_resume.assert_called_once()
+
+
+def test_hook_installs_view_above_min_savings(monkeypatch):
+    """Positive control: a view with real savings is installed as before."""
+    import hashlib
+    from unittest.mock import MagicMock, patch
+
+    import gptme.tools.autocompact.hook as hook_module
+    from gptme.tools.autocompact.context_provider import CompactionResult
+
+    hook_module._last_autocompact_attempt.clear()
+    hook_module._failed_summarize.clear()
+    monkeypatch.setattr(hook_module, "_autocompact_min_interval", 60)
+
+    big = "token " * 4000
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", big),
+        Message("system", big),
+    ]
+    manager = MagicMock()
+    manager.logdir = "/tmp/conv-savings-pass"
+    manager.current_branch = "master"
+    manager.current_view = "main"
+
+    def set_msgs(compacted):
+        manager.log.messages = compacted
+
+    manager.log.messages = msgs
+
+    mock_provider = MagicMock()
+
+    def fake_compress(messages, config):
+        compacted = [messages[0], Message("system", "compacted")]
+        return CompactionResult(
+            messages=compacted,
+            source_digest=hashlib.sha256(b"small").hexdigest(),
+            covered_through=len(messages) - 1,
+        )
+
+    mock_provider.compress.side_effect = fake_compress
+    manager.create_view.side_effect = lambda _name, compacted: set_msgs(compacted)
+
+    with (
+        patch(
+            "gptme.tools.autocompact.hook.should_auto_compact",
+            return_value="rule_based",
+        ),
+        patch(
+            "gptme.tools.autocompact.hook.get_context_provider",
+            return_value=mock_provider,
+        ),
+        patch("gptme.tools.autocompact.hook.trigger_hook", return_value=iter([])),
+    ):
+        list(hook_module.autocompact_hook(manager))
+
+    assert manager.create_view.called, "a view with real savings should be installed"
+
+
+def test_bound_summarize_input_clips_tool_output_and_drops_oldest():
+    from gptme.tools.autocompact.resume import (
+        _SUMMARY_PROMPT_OVERHEAD_TOKENS,
+        SUMMARY_MAX_OUTPUT_TOKENS,
+        SUMMARY_MAX_TOOL_OUTPUT_TOKENS,
+        _bound_summarize_input,
+    )
+
+    model = "gpt-4"
+    big = "line of tool output\n" * 20000
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", "first task"),
+        Message("system", big),
+        Message("assistant", "ok"),
+        Message("user", "second task"),
+        Message("assistant", "done"),
+    ]
+    # Clipping only (no window): head verbatim, tool output clipped, count unchanged
+    out = _bound_summarize_input(msgs, model, None, keep_head=1)
+    assert len(out) == len(msgs)
+    assert out[0].content == "System prompt"
+    assert len_tokens(out[2].content, model) <= SUMMARY_MAX_TOOL_OUTPUT_TOKENS
+    assert "characters omitted" in out[2].content
+
+    # Tight window: oldest post-head messages dropped, recent tail + head kept.
+    # The summarizer prompt is passed as an explicit reserve, matching the caller.
+    resume_request = Message("user", "Summarize the conversation. " * 40)
+    out = _bound_summarize_input(
+        msgs,
+        model,
+        12500,
+        keep_head=1,
+        extra_reserve_tokens=len_tokens(resume_request, model),
+    )
+    assert out[0].content == "System prompt"
+    assert "older messages omitted" in out[1].content
+    assert out[-1].content == "done"
+    # More than one message was dropped (the single marker absorbs the rest).
+    assert len(out) < len(msgs)
+
+    # The FULL request the caller assembles fits the window.
+    full = out + [resume_request]
+    assert len_tokens(full, model) <= (
+        12500 - SUMMARY_MAX_OUTPUT_TOKENS - _SUMMARY_PROMPT_OVERHEAD_TOKENS
+    )
+
+
+def test_bound_summarize_input_preserves_long_user_request():
+    """A long user request carries requirements; it must not be clipped as tool output."""
+    from gptme.tools.autocompact.resume import (
+        SUMMARY_MAX_TOOL_OUTPUT_TOKENS,
+        _bound_summarize_input,
+    )
+
+    model = "gpt-4"
+    request = "Requirement: do the thing.\n" * 2000
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", request),
+        Message("assistant", "done"),
+    ]
+    assert len_tokens(request, model) > SUMMARY_MAX_TOOL_OUTPUT_TOKENS
+
+    out = _bound_summarize_input(msgs, model, None, keep_head=1)
+    assert out[1].content == request, "user requirements must survive verbatim"
+
+
+def test_bound_summarize_input_clips_when_newest_message_exceeds_window():
+    """Even a single oversized newest message is clipped, not sent as-is."""
+    from gptme.tools.autocompact.resume import (
+        _SUMMARY_PROMPT_OVERHEAD_TOKENS,
+        SUMMARY_MAX_OUTPUT_TOKENS,
+        _bound_summarize_input,
+    )
+
+    model = "gpt-4"
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", "hi"),
+        Message("assistant", "blah " * 60000),
+    ]
+    context_window = 30000
+    out = _bound_summarize_input(msgs, model, context_window, keep_head=1)
+    assert len_tokens(out, model) <= (
+        context_window - SUMMARY_MAX_OUTPUT_TOKENS - _SUMMARY_PROMPT_OVERHEAD_TOKENS
+    )
+
+
+def test_bound_summarize_input_boundary_clip_stays_within_budget():
+    """A boundary body message clipped to a small share must still fit the budget.
+
+    The clip runs with only the remaining body budget; if the clipped message
+    overshot it, the assembled request would exceed the window this PR exists
+    to bound.
+    """
+    from gptme.tools.autocompact.resume import (
+        _SUMMARY_PROMPT_OVERHEAD_TOKENS,
+        SUMMARY_MAX_OUTPUT_TOKENS,
+        _bound_summarize_input,
+    )
+
+    model = "gpt-4"
+    context_window = 13000
+    budget = (
+        context_window - SUMMARY_MAX_OUTPUT_TOKENS - _SUMMARY_PROMPT_OVERHEAD_TOKENS
+    )
+    msgs = [
+        Message("system", "System prompt"),
+        Message("user", "requirement line\n" * 40000),
+    ]
+    out = _bound_summarize_input(msgs, model, context_window, keep_head=1)
+    assert len_tokens(out, model) <= budget
+
+
+def test_bound_summarize_input_head_over_budget_keeps_conversation():
+    """A system prompt over the window must not starve the conversation.
+
+    Returning the clipped head alone makes the summarizer build a resume from
+    system instructions with no task or progress, and that resume then replaces
+    the working history. The newest conversation messages must survive.
+    """
+    from gptme.tools.autocompact.resume import (
+        _SUMMARY_PROMPT_OVERHEAD_TOKENS,
+        SUMMARY_MAX_OUTPUT_TOKENS,
+        _bound_summarize_input,
+    )
+
+    model = "gpt-4"
+    huge_system = "system instruction line\n" * 40000
+    msgs = [
+        Message("system", huge_system),
+        Message("user", "the actual task"),
+        Message("assistant", "working on it"),
+        Message("user", "newest progress"),
+    ]
+    context_window = 30000
+    out = _bound_summarize_input(msgs, model, context_window, keep_head=1)
+
+    assert out[0].content != huge_system, "oversized system prompt must be clipped"
+    assert any(m.content == "newest progress" for m in out), (
+        "newest conversation message must survive a head-over-budget request"
+    )
+    assert len_tokens(out, model) <= (
+        context_window - SUMMARY_MAX_OUTPUT_TOKENS - _SUMMARY_PROMPT_OVERHEAD_TOKENS
+    )
+
+
+def test_bound_summarize_input_head_under_budget_keeps_conversation():
+    """A system prompt just under the window must not starve the conversation.
+
+    The head fits ``budget`` but leaves less than the omission-marker reserve for
+    the body, so ``body_budget = budget - head_tokens - reserve`` goes
+    non-positive and the function used to return the head alone, dropping every
+    user/assistant message. The newest conversation message must survive.
+    """
+    from gptme.tools.autocompact.resume import (
+        _OMISSION_MARKER_RESERVE_TOKENS,
+        _SUMMARY_PROMPT_OVERHEAD_TOKENS,
+        SUMMARY_MAX_OUTPUT_TOKENS,
+        _bound_summarize_input,
+    )
+
+    model = "gpt-4"
+    context_window = 30000
+    budget = (
+        context_window - SUMMARY_MAX_OUTPUT_TOKENS - _SUMMARY_PROMPT_OVERHEAD_TOKENS
+    )
+    unit = "system instruction line with several words here\n"
+    per = len_tokens(unit, model)
+    head_text = unit * max((budget - _OMISSION_MARKER_RESERVE_TOKENS) // per, 1)
+    # Land the head in (budget - reserve, budget]: it fits the window itself but
+    # leaves no usable room for the body.
+    while len_tokens(head_text, model) <= budget - _OMISSION_MARKER_RESERVE_TOKENS:
+        head_text += unit
+    head_tokens = len_tokens(head_text, model)
+    assert budget - _OMISSION_MARKER_RESERVE_TOKENS < head_tokens <= budget
+
+    msgs = [
+        Message("system", head_text),
+        Message("user", "the actual task"),
+        Message("assistant", "working on it"),
+        Message("user", "newest progress"),
+    ]
+    out = _bound_summarize_input(msgs, model, context_window, keep_head=1)
+
+    assert any(m.content == "newest progress" for m in out), (
+        "newest conversation message must survive a near-budget system prompt"
+    )
+    assert len_tokens(out, model) <= (
+        context_window - SUMMARY_MAX_OUTPUT_TOKENS - _SUMMARY_PROMPT_OVERHEAD_TOKENS
+    )
+
+
+def test_bound_summarize_input_head_over_budget_multiple_head_messages():
+    """Multiple oversized head messages must not overrun the head's share.
+
+    A proportional per-message split can overrun its total by a token per
+    message; if that pushed the clipped head up to the whole budget, the body
+    budget would go non-positive and the conversation would be dropped again.
+    """
+    from gptme.tools.autocompact.resume import (
+        _SUMMARY_PROMPT_OVERHEAD_TOKENS,
+        SUMMARY_MAX_OUTPUT_TOKENS,
+        _bound_summarize_input,
+    )
+
+    model = "gpt-4"
+    msgs = [
+        Message("system", "first system block\n" * 20000),
+        Message("system", "second system block\n" * 20000),
+        Message("user", "the actual task"),
+        Message("user", "newest progress"),
+    ]
+    context_window = 30000
+    out = _bound_summarize_input(msgs, model, context_window, keep_head=2)
+
+    assert any(m.content == "newest progress" for m in out), (
+        "newest conversation message must survive a multi-head over-budget request"
+    )
+    assert len_tokens(out, model) <= (
+        context_window - SUMMARY_MAX_OUTPUT_TOKENS - _SUMMARY_PROMPT_OVERHEAD_TOKENS
+    )
+
+
+def test_clip_messages_to_budget_never_exceeds_budget():
+    """A share below the omission-marker cost must not overrun the budget.
+
+    _clip_middle cannot produce output smaller than its marker, so a message
+    with a one-token share would otherwise overshoot and make the head swallow
+    the body budget.
+    """
+    from gptme.tools.autocompact.resume import _clip_messages_to_budget
+
+    model = "gpt-4"
+    msgs = [Message("system", "long head text " * 5000) for _ in range(3)]
+    out = _clip_messages_to_budget(msgs, 10, model)
+    assert len_tokens(out, model) <= 10
+
+
+def test_clip_middle_respects_cap_exactly():
+    from gptme.tools.autocompact.resume import _clip_middle
+
+    model = "gpt-4"
+    content = "dense text with no newlines " * 50000
+    for cap in (2000, 500, 120):
+        clipped = _clip_middle(content, cap, model)
+        assert len_tokens(clipped, model) <= cap
+        assert "characters omitted" in clipped
+        assert clipped is not content
+
+
+def test_clip_middle_never_exceeds_sub_token_cap():
+    """A single character can cost more than a sub-token cap; return empty then.
+
+    Emoji cost >1 token per character, so the hard-prefix fallback can still
+    overshoot a 1-token cap with one character. The cap contract must hold.
+    """
+    from gptme.tools.autocompact.resume import _clip_middle
+
+    model = "gpt-4"
+    clipped = _clip_middle("\U0001f600" * 1000, 1, model)
+    assert len_tokens(clipped, model) <= 1

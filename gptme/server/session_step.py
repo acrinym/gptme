@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable
+from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,7 @@ from ..logmanager import LogManager, prepare_messages
 from ..message import Message, MessageMetadata, MessageTimings
 from ..telemetry import trace_function
 from ..tools import ToolUse, get_tools
+from ..tools._url_safety import set_session_allow_hosts
 from ..tools.shell import set_workspace_cwd
 from ..util.cost_tracker import CostTracker, session_id_for_logdir
 from .api_v2_common import ConfigChangedEvent, ErrorEvent, msg2dict
@@ -215,6 +217,43 @@ def _get_use_acp_default() -> bool:
     if val is None:
         return False
     return val.lower() in ("1", "true", "yes", "on")
+
+
+@contextmanager
+def _released(lock: threading.RLock):
+    """Drop a reentrant lock around blocking I/O, then re-acquire it."""
+    lock.release()
+    try:
+        yield
+    finally:
+        lock.acquire()
+
+
+def _compact_after_tool_results(
+    manager: LogManager,
+    session: ConversationSession,
+    conversation_id: str,
+    llm_unlocked: AbstractContextManager[object] | None = None,
+) -> None:
+    """Run always-on compaction after tool results are on the log.
+
+    Server TURN_POST fires after the assistant message and before tools run.
+    Removing request-time ``reduce_log`` from ``prepare_messages`` means a
+    large tool result can otherwise ride the continuation request past the
+    context budget until the next assistant TURN_POST.
+    """
+    from ..hooks import StopPropagation
+    from ..tools.autocompact.hook import autocompact_hook
+
+    try:
+        for hook_msg in autocompact_hook(manager, llm_unlocked=llm_unlocked):
+            if isinstance(hook_msg, StopPropagation):
+                continue
+            _append_and_notify(manager, session, hook_msg)
+    except Exception:
+        logger.exception(
+            "Post-tool compaction failed for conversation %s", conversation_id
+        )
 
 
 def _append_and_notify(manager: LogManager, session: ConversationSession, msg: Message):
@@ -478,6 +517,9 @@ async def _acp_step(
             tools=chat_config.tools,
             chat_config=chat_config,
         )
+
+        # Enforce the session's URL-host allowlist on this step context.
+        set_session_allow_hosts(chat_config.allow_hosts)
 
         manager = LogManager.load(conversation_id, lock=False)
         CostTracker.ensure_session(session_id_for_logdir(manager.logdir))
@@ -753,6 +795,11 @@ def step(
         tools=chat_config.tools,
         chat_config=chat_config,
     )
+
+    # Enforce the session's URL-host allowlist for tools executed directly
+    # on this step thread (execute_tool_thread sets it again for its own
+    # execution context).
+    set_session_allow_hosts(chat_config.allow_hosts)
 
     # Load conversation
     manager = LogManager.load(
@@ -1173,6 +1220,12 @@ def start_tool_execution(
         current_conversation_id.set(conversation_id)
         current_session_id.set(session.id)
 
+        # Enforce the session's URL-host allowlist in this execution context.
+        # Tools run on this thread, not the step thread, so the ContextVar
+        # must be set here -- the saved allowlist in chat_config is otherwise
+        # silently unenforced in server deployments.
+        set_session_allow_hosts(chat_config.allow_hosts)
+
         try:
             # Prepare execution environment (config, tools, hooks, .env)
             prepare_execution_environment(
@@ -1380,6 +1433,28 @@ def start_tool_execution(
                     # bookkeeping state as quiescent.
                     with SessionManager.conversation_lock(conversation_id):
                         session._executing_tools.discard(claimed_tool_id)
+
+            # Compact after tool results, before the continuation provider call.
+            # Serialize with the same conversation lock as tool-result appends
+            # and continuation election so concurrent workers cannot race view
+            # creation or the active-view marker.
+            try:
+                conv_lock = SessionManager.conversation_lock(conversation_id)
+                with conv_lock:
+                    manager = LogManager.load(
+                        conversation_id, branch=branch, lock=False
+                    )
+                    _compact_after_tool_results(
+                        manager,
+                        session,
+                        conversation_id,
+                        llm_unlocked=_released(conv_lock),
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to load conversation %s for post-tool compaction",
+                    conversation_id,
+                )
 
             # Elect exactly one continuation while holding the same lock used to
             # add and remove execution claims. This makes quiescence observation

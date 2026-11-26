@@ -4,8 +4,12 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
+
+if TYPE_CHECKING:
+    from .app import GptmeApp
 
 from ..config import setup_config_from_cli
 from ..dirs import get_logs_dir
@@ -15,6 +19,7 @@ from ..message import set_output_format
 from ..prompts import get_prompt
 from ..tools import get_tools
 from ..util.auto_naming import generate_conversation_id
+from ..util.multiprompt import group_prompt_args
 
 logger = logging.getLogger(__name__)
 
@@ -28,40 +33,125 @@ def _get_logdir(name: str) -> Path:
     return logdir
 
 
-def _get_logdir_resume() -> Path:
-    """Get the most recently modified conversation."""
-    logs_dir = get_logs_dir()
-    candidates = sorted(
-        (d for d in logs_dir.iterdir() if (d / "conversation.jsonl").exists()),
-        key=lambda d: (d / "conversation.jsonl").stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
-        raise click.UsageError("No conversation found to resume.")
-    return candidates[0]
+def _get_logdir_resume(name: str) -> Path:
+    """Get the named conversation, which must exist."""
+    logdir = get_logs_dir() / name
+    if not (logdir / "conversation.jsonl").exists():
+        raise click.UsageError(f"No conversation named '{name}' to resume.")
+    return logdir
+
+
+def _select_logdir(name: str, resume: str | None) -> Path:
+    """Resolve the conversation from --name / --resume [NAME]."""
+    if resume is None:
+        return _get_logdir(name)
+    # `--resume --name X` (the CLI spelling) works too
+    if target := resume or (name if name != "random" else None):
+        return _get_logdir_resume(target)
+    if not sys.stdin.isatty():
+        raise click.UsageError(
+            "--resume without a name needs a terminal to pick from; "
+            "pass the conversation name: --resume <name>"
+        )
+    from ..cli.main import pick_log
+
+    return pick_log()
 
 
 def _print_history(manager: LogManager, limit: int = 50) -> None:
     """Print past messages to the terminal before an inline session starts."""
     from rich.console import Console
 
-    from .app import renderables_for_message
+    from .app import (
+        _highlight_default,
+        _show_hidden_default,
+        _show_thinking_default,
+        renderables_for_message,
+    )
 
     console = Console()
-    msgs = [m for m in manager.log if not m.hide]
+    show_hidden = _show_hidden_default()
+    msgs = [m for m in manager.log if show_hidden or not m.hide]
     if len(msgs) > limit:
         console.print(f"[dim]… {len(msgs) - limit} earlier messages not shown[/dim]")
         msgs = msgs[-limit:]
+    show_thinking = _show_thinking_default()
+    highlight = _highlight_default()
     for msg in msgs:
-        for renderable in renderables_for_message(msg):
+        for renderable in renderables_for_message(
+            msg, show_thinking=show_thinking, highlight=highlight
+        ):
             console.print(renderable)
 
 
-@click.command("gptme-tui")
+def _finish_session(app: "GptmeApp", conversation_name: str) -> None:
+    """Run SESSION_END hooks, then act on a requested /restart.
+
+    ``_do_restart`` replaces the process and never returns, so session-end
+    cleanup (persistent shell, orphaned subagents, cost summary) has to run
+    first. ``/restart web`` doesn't exec: it releases the conversation, opens
+    the browser and returns so main() exits normally.
+    """
+    app.end_session()
+    if app.restart_requested:
+        from ..tools.restart import RestartError, _do_restart, open_web
+
+        if app.restart_web_url:
+            open_web(app.restart_web_url)
+            return
+        # The new process takes its workspace from our cwd. If the workspace
+        # directory was moved or replaced during the session, that cwd is
+        # stale (getcwd() fails): re-enter it by path. If it's gone, don't
+        # restart somewhere else.
+        try:
+            os.chdir(app.workspace)
+        except OSError as e:
+            print(f"Not restarting: workspace {app.workspace} is unavailable ({e}).")
+            return
+        program = "gptme" if app.restart_target == "cli" else "gptme-tui"
+        print(f"Restarting {program} with conversation: {conversation_name}")
+        try:
+            _do_restart(conversation_name, target=app.restart_target, source="tui")
+        except RestartError as e:
+            print(f"Not restarting: {e}")
+
+
+def _current_dir() -> Path:
+    """The working directory, re-resolved by path if it went stale.
+
+    ``getcwd()`` fails when the directory was deleted or replaced (e.g. moved
+    and recreated) under the process, even if the same path exists again.
+    """
+    try:
+        return Path.cwd()
+    except FileNotFoundError:
+        pwd = os.environ.get("PWD")
+        if pwd and Path(pwd).is_dir():
+            os.chdir(pwd)
+            return Path(pwd)
+        raise click.ClickException(
+            "The current directory no longer exists; cd to the workspace "
+            "(or pass --workspace) and try again."
+        ) from None
+
+
+@click.command(
+    "gptme-tui",
+    context_settings={"ignore_unknown_options": True},
+)
+@click.argument("prompts", nargs=-1)
 @click.option(
     "-n", "--name", default="random", help="Conversation name to open or create."
 )
-@click.option("-r", "--resume", is_flag=True, help="Resume the last conversation.")
+@click.option(
+    "-r",
+    "--resume",
+    is_flag=False,
+    flag_value="",
+    default=None,
+    metavar="[NAME]",
+    help="Resume a conversation: NAME if given, else pick one from a list.",
+)
 @click.option(
     "-m",
     "--model",
@@ -102,8 +192,9 @@ def _print_history(manager: LogManager, limit: int = 50) -> None:
 )
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging.")
 def main(
+    prompts: tuple[str, ...],
     name: str,
-    resume: bool,
+    resume: str | None,
     model: str | None,
     workspace: str | None,
     tool_allowlist: str | None,
@@ -117,6 +208,9 @@ def main(
 
     Complementary to the plain `gptme` CLI: supports queueing prompts while
     the agent works, collapsible tool output, and a live status bar.
+
+    PROMPTS are submitted on start, like with `gptme`; chain several with
+    '-' (e.g. `gptme-tui "write a script" - "now test it"`).
     """
     try:
         from .app import GptmeApp
@@ -131,8 +225,10 @@ def main(
     # messages itself (streaming via on_token, results via step() yields)
     set_output_format("quiet")
 
-    logdir = _get_logdir_resume() if resume else _get_logdir(name)
-    workspace_path = Path(workspace).expanduser().resolve() if workspace else Path.cwd()
+    logdir = _select_logdir(name, resume)
+    workspace_path = (
+        Path(workspace).expanduser().resolve() if workspace else _current_dir()
+    )
 
     config = setup_config_from_cli(
         workspace=workspace_path,
@@ -177,7 +273,10 @@ def main(
         )
     )
 
-    manager = LogManager.load(logdir, initial_msgs=initial_msgs, create=True)
+    try:
+        manager = LogManager.load(logdir, initial_msgs=initial_msgs, create=True)
+    except RuntimeError as e:  # e.g. the conversation is open in another process
+        raise click.ClickException(str(e)) from e
     os.chdir(workspace_path)
 
     app = GptmeApp(
@@ -187,6 +286,7 @@ def main(
         auto_confirm=no_confirm,
         inline=inline,
         experimental_jelly_errors=experimental_jelly_errors,
+        initial_prompts=group_prompt_args(prompts),
     )
     if inline:
         _print_history(manager)
@@ -194,6 +294,8 @@ def main(
         app.run(inline=True, inline_no_clear=True, mouse=False)
     else:
         app.run()
+    # SESSION_END before re-exec: _do_restart never returns
+    _finish_session(app, logdir.name)
     print(f"Conversation saved: {logdir.name}")
     print(f"Resume with: gptme-tui -n {logdir.name}  (or gptme -r in the CLI)")
     sys.exit(0)

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+import warnings
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,32 @@ async def test_e2e_tool_skip(mock_app, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_e2e_ctrl_c_cancels_tool_confirm(mock_app, tmp_path):
+    """Ctrl+C at the confirm dialog declines the tool and interrupts the turn."""
+    app = mock_app
+    marker = f"marker_{uuid.uuid4().hex[:8]}"
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = f"run this:\n```shell\ntouch {tmp_path / marker}\n```"
+        await pilot.press("enter")
+        await wait_for(
+            pilot,
+            lambda: isinstance(app.screen_stack[-1], ConfirmScreen),
+            what="confirmation dialog",
+        )
+        await pilot.press("ctrl+c")
+        await wait_for(
+            pilot,
+            lambda: not app.generating and app.state == "idle",
+            what="generation to finish",
+        )
+        assert not isinstance(app.screen_stack[-1], ConfirmScreen)
+        assert not (tmp_path / marker).exists(), "cancelled tool must not execute"
+        assert app.is_running, "Ctrl+C at a dialog must not quit the app"
+
+
+@pytest.mark.asyncio
 async def test_e2e_queue_dispatches_after_turn(mock_app, monkeypatch):
     """Prompts queued while generating are submitted when the turn ends."""
     import threading
@@ -217,6 +244,71 @@ async def test_e2e_queue_dispatches_after_turn(mock_app, monkeypatch):
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+async def test_e2e_tools_still_run_after_subagent(tmp_path, monkeypatch):
+    """Regression: after the assistant spawns a thread-mode subagent from
+    ipython, later tool calls in the session must still execute.
+
+    The subagent's nested chat() used to reset the process-global tool format
+    to "markdown", so the parent's native ``@tool(id): {...}`` calls were no
+    longer parsed and silently never ran.
+    """
+    pytest.importorskip("IPython")
+    import json
+
+    monkeypatch.setenv("GPTME_MAX_STEPS", "1")
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))
+    from gptme.tools import clear_tools
+
+    tools = ["shell", "ipython", "subagent"]
+    init("mock/echo", interactive=True, tool_allowlist=tools, tool_format="tool")
+    set_default_model("mock/echo")
+    # fresh load so ipython registers the subagent functions
+    clear_tools()
+    init_tools(tools)
+    set_output_format("quiet")
+    manager = LogManager([], logdir=tmp_path / "conv", lock=False)
+    app = GptmeApp(manager, tool_format="tool", workspace=tmp_path, auto_confirm=True)
+
+    code = (
+        'subagent("t1", "hi\\n```complete\\nSUB-DONE\\n```")\n'
+        'print("STATUS", subagent_wait("t1", timeout=60)["status"])'
+    )
+    calls = [
+        "@ipython(c1): " + json.dumps({"code": code}),
+        "@shell(c2): " + json.dumps({"command": "echo after-subagent"}),
+        "@ipython(c3): " + json.dumps({"code": "print(40 + 2)"}),
+    ]
+
+    def tool_results() -> list[str]:
+        return [
+            m.content
+            for m in manager.log
+            if m.role == "system"
+            and ("Executed code block" in m.content or "echo" in m.content)
+        ]
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        for i, call in enumerate(calls):
+            inp = app.query_one("#input", ChatInput)
+            # leading line keeps the call at line-start after the "Echo: " prefix
+            inp.text = f"step {i}\n{call}"
+            await pilot.press("enter")
+            await wait_for(
+                pilot,
+                lambda n=i + 1: not app.generating and len(tool_results()) >= n,
+                timeout=90,
+                what=f"tool result for step {i}",
+            )
+
+    results = tool_results()
+    assert "STATUS success" in results[0]
+    assert "after-subagent" in results[1]
+    assert "42" in results[2]
+
+
 # ---------------------------------------------------------------------------
 # Real-TTY tests via tmux
 # ---------------------------------------------------------------------------
@@ -252,39 +344,55 @@ class TmuxTUI:
             f"env {env} {sys.executable} -m gptme.tui.main "
             f"-m mock/echo -w {tmp_path} {extra_args}"
         )
-        subprocess.run(
-            [
-                "tmux",
-                "new-session",
-                "-d",
-                "-s",
-                self.session,
-                "-x",
-                str(size[0]),
-                "-y",
-                str(size[1]),
-                cmd,
-            ],
-            check=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    self.session,
+                    "-x",
+                    str(size[0]),
+                    "-y",
+                    str(size[1]),
+                    cmd,
+                ],
+                check=True,
+                timeout=15,
+            )
+        except BaseException:
+            # new-session can create the detached session before the client
+            # returns. If we raise here the fixture never records us, so
+            # kill best-effort before propagating.
+            self.kill()
+            raise
 
     def send(self, keys: str, literal: bool = True) -> None:
         args = ["tmux", "send-keys", "-t", self.session]
         if literal:
             args.append("-l")
         args.append(keys)
-        subprocess.run(args, check=True)
+        subprocess.run(args, check=True, timeout=10)
 
     def send_key(self, key: str) -> None:
         """Send a named key (Enter, Escape, Tab, …)."""
-        subprocess.run(["tmux", "send-keys", "-t", self.session, key], check=True)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session, key], check=True, timeout=10
+        )
 
     def capture(self) -> str:
+        # pytest-timeout cannot interrupt a blocked tmux subprocess
+        # (gptme/gptme#4009 hung TestTmuxRealTerminal until the 6h job cap).
+        # Bound the call so a wedged tmux fails this test instead of hanging
+        # the job. Do not translate timeout into "" — negative assertions
+        # (assert_no_escape_garbage) would then pass on an unread pane.
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", self.session, "-p"],
             check=True,
             capture_output=True,
             text=True,
+            timeout=5,
         )
         return result.stdout
 
@@ -295,6 +403,7 @@ class TmuxTUI:
             check=True,
             capture_output=True,
             text=True,
+            timeout=5,
         )
         return result.stdout
 
@@ -316,7 +425,7 @@ class TmuxTUI:
         Right after first paint, Textual is still negotiating terminal
         protocols and can drop the first keypress.
         """
-        self.wait_for("Type a message")
+        self.wait_for("Ctrl+J newline")
         time.sleep(0.7)
 
     def resume(self, expect: str, timeout: float = 10.0) -> str:
@@ -335,17 +444,96 @@ class TmuxTUI:
         )
 
     def alive(self) -> bool:
-        return (
-            subprocess.run(
-                ["tmux", "has-session", "-t", self.session],
-                capture_output=True,
-                check=False,
-            ).returncode
-            == 0
-        )
+        try:
+            return (
+                subprocess.run(
+                    ["tmux", "has-session", "-t", self.session],
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                ).returncode
+                == 0
+            )
+        except subprocess.TimeoutExpired:
+            return False
 
     def kill(self) -> None:
-        subprocess.run(["tmux", "kill-session", "-t", self.session], check=False)
+        # timeout_func_only leaves teardown unguarded; a wedged kill-session
+        # previously held the xdist worker until GitHub cancelled the job.
+        try:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", self.session],
+                check=False,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            warnings.warn(
+                f"tmux kill-session timed out for {self.session}; session may leak",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+
+def test_tmux_kill_returns_when_tmux_blocks(monkeypatch):
+    """Regression: unbounded kill-session hung an xdist worker for 6h (#4009)."""
+
+    def fake_run(*args, **kwargs):
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            raise AssertionError("tmux kill-session must pass timeout=")
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=timeout)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    tui = TmuxTUI.__new__(TmuxTUI)
+    tui.session = "tuie2e_fake"
+    with pytest.warns(RuntimeWarning, match="kill-session timed out"):
+        tui.kill()
+
+
+def test_tmux_capture_timeout_is_not_empty_pane(monkeypatch):
+    """Timed-out capture must not look like an empty pane (false-pass)."""
+
+    def fake_run(*args, **kwargs):
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            raise AssertionError("tmux capture-pane must pass timeout=")
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=timeout)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    tui = TmuxTUI.__new__(TmuxTUI)
+    tui.session = "tuie2e_fake"
+    with pytest.raises(subprocess.TimeoutExpired):
+        tui.capture()
+
+
+def test_tmux_init_kills_session_if_startup_times_out(tmp_path, monkeypatch):
+    """If new-session times out after creating the session, kill it.
+
+    Distinguishes the cleanup-success path from kill() itself timing out
+    (covered by test_tmux_kill_returns_when_tmux_blocks). A fake that times
+    out on every tmux call would only prove we *attempted* kill-session.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            raise AssertionError("tmux calls must pass timeout=")
+        if list(args)[:2] == ["tmux", "new-session"]:
+            raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(subprocess.TimeoutExpired):
+            TmuxTUI(tmp_path)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)], (
+        "kill-session succeeded; kill() must not warn"
+    )
+    assert any(c[:2] == ["tmux", "new-session"] for c in calls)
+    assert any(c[:2] == ["tmux", "kill-session"] for c in calls)
 
 
 @pytest.fixture
@@ -457,7 +645,7 @@ class TestTmuxInlineMode:
         tui.send_key("Enter")
         tui.wait_for("Echo: hello inline")
         # Wait for the input prompt to confirm rendering is complete.
-        tui.wait_for("Type a message")
+        tui.wait_for("Ctrl+J newline")
         # In --inline mode the response is emitted to native scrollback (above
         # the live input region). tmux capture-pane without -S only shows the
         # current 30-line visible screen, so "Echo: hello inline" can scroll
@@ -470,7 +658,7 @@ class TestTmuxInlineMode:
         # input region which contains the prompt (higher index). Use rindex so
         # we compare against the re-rendered prompt AFTER the echo, not the
         # initial startup prompt that appears earlier in the scrollback.
-        assert pane.index("Echo: hello inline") < pane.rindex("Type a message")
+        assert pane.index("Echo: hello inline") < pane.rindex("Ctrl+J newline")
 
     def test_inline_tool_flow(self, tmux_tui, tmp_path):
         marker = tmp_path / "inline_marker"

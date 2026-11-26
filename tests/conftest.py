@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -337,6 +338,29 @@ def restore_cwd():
     os.chdir(original_cwd)
 
 
+@pytest.fixture(autouse=True)
+def reset_session_allow_hosts() -> Iterator[None]:
+    """Clear the web-tool host allowlist around every test.
+
+    ``set_session_allow_hosts`` writes a module-level ``ContextVar`` that
+    outlives the test that set it on the same xdist worker. A test that installs
+    an explicit allowlist — e.g. the empty ``[]`` in ``test_url_safety.py``,
+    which means "block every host" — otherwise leaks it to every later test on
+    that worker, so an unrelated browser test fails deterministically depending
+    on run order with ``Host 'example.com' is not in the session's
+    allowed-hosts list ()``. Reset to ``None`` (unrestricted, the default)
+    before and after each test so no test can observe or leave a stale list.
+
+    ``tests/test_session_allowlist_isolation.py`` drives this fixture's own
+    generator directly, so the guard fails if the reset wiring is ever removed.
+    """
+    from gptme.tools._url_safety import set_session_allow_hosts
+
+    set_session_allow_hosts(None)
+    yield
+    set_session_allow_hosts(None)
+
+
 #: nodeid -> leaked thread names, collected across the session for the summary.
 _thread_leaks: dict[str, list[str]] = {}
 
@@ -460,6 +484,24 @@ def cleanup_shell_after():
     # synchronously in one thread/context, so a bare `ContextVar.set()` with
     # no matching `.reset()` persists past the test that made it.
     shell_module._workspace_cwd.set(None)
+
+
+@pytest.fixture(autouse=True)
+def reset_allow_hosts_after():
+    """Reset the URL host allowlist ContextVar after each test.
+
+    ``set_session_allow_hosts()`` stores policy in a ContextVar.  pytest runs
+    tests synchronously in one thread/context, so a bare ``ContextVar.set()``
+    with no matching ``.reset()`` persists past the test that made it.  Without
+    this fixture, ``test_url_safety.py::test_empty_allowlist_blocks_all_hosts``
+    leaves ``_allow_hosts_var`` set to ``[]`` for every subsequent test on the
+    same xdist worker, causing ``TestPlaywrightMarkdownResponse`` (and others)
+    to fail with "Host 'x' is not in the session's allowed-hosts list ()".
+    """
+    yield
+    from gptme.tools._url_safety import set_session_allow_hosts
+
+    set_session_allow_hosts(None)
 
 
 @pytest.fixture(autouse=True)
@@ -610,7 +652,17 @@ def init_(monkeypatch):
     # leak into subsequent tests that use a non-local provider.
     if model and model.startswith("local/") and not os.environ.get("OPENAI_BASE_URL"):
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:666")
-    init(model, interactive=False, tool_allowlist=None, tool_format="markdown")
+    # init() registers /skill commands from a fresh LessonIndex, whose default
+    # dirs are the developer's real ~/.config/gptme/lessons, ~/.agents/lessons
+    # and ~/.claude/skills. Scanning those per test made every test read the
+    # host's lessons (not hermetic) and cost ~200ms of setup per test on a
+    # machine with ~1k lessons -- 3x the whole suite's runtime. Scope the
+    # override to init() so tests that exercise lesson discovery are unaffected.
+    from gptme.lessons.index import LessonIndex
+
+    with monkeypatch.context() as m:
+        m.setattr(LessonIndex, "_default_dirs", staticmethod(lambda: []))
+        init(model, interactive=False, tool_allowlist=None, tool_format="markdown")
 
 
 @pytest.fixture
@@ -835,20 +887,49 @@ _LOCAL_FORM_HTML = """\
 </html>
 """
 
+_LOCAL_TEXT_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Test Page</title></head>
+<body>
+<h1>Example Domain</h1>
+<p>This domain is for use in documentation examples.</p>
+</body>
+</html>
+"""
 
-class _LocalFormHandler(http.server.BaseHTTPRequestHandler):
-    """Minimal HTTP handler that serves a simple form page."""
+
+class _LocalHTMLHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal HTTP handler that serves a fixed HTML document."""
+
+    html: str = ""
 
     def log_message(self, *args):  # suppress request logs in test output
         pass
 
     def do_GET(self):
-        encoded = _LOCAL_FORM_HTML.encode()
+        encoded = type(self).html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+
+@contextmanager
+def _serve_local_html(html: str):
+    """Serve a fixed HTML document from a background thread; yield its URL."""
+    handler = type("_Handler", (_LocalHTMLHandler,), {"html": html})
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}/"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.fixture()
@@ -858,13 +939,19 @@ def local_form_page():
     Replaces external URLs (e.g. duckduckgo.com) in browser tests so the
     suite stays hermetic and free of network flakiness.
     """
-    server = http.server.HTTPServer(("127.0.0.1", 0), _LocalFormHandler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{port}/"
-    server.shutdown()
-    thread.join(timeout=2)
+    with _serve_local_html(_LOCAL_FORM_HTML) as url:
+        yield url
+
+
+@pytest.fixture()
+def local_text_page():
+    """Serve a minimal HTML text page locally and yield its URL.
+
+    Replaces external URLs (e.g. example.com) in browser tests so the suite
+    stays hermetic and free of network flakiness.
+    """
+    with _serve_local_html(_LOCAL_TEXT_HTML) as url:
+        yield url
 
 
 @pytest.fixture
@@ -893,22 +980,3 @@ def wait_for_event():
         return False
 
     return wait
-
-
-@pytest.fixture(autouse=True)
-def _clear_proactive_summarize_cache():
-    """Clear the proactive-summarize in-process cache between tests.
-
-    The cache is module-level state. Without this fixture a test that calls
-    proactive_summarize_log will populate the cache with whatever fake/mocked
-    summary it used, and a later test that patches gptme.llm.summarize with a
-    *different* mock will silently get the earlier test's cached result instead
-    of its own mock's return value — causing hard-to-diagnose assertion failures.
-    """
-    import gptme.util.reduce as reduce_mod
-
-    reduce_mod._proactive_summarize_cache.clear()
-    reduce_mod._proactive_summarize_cache_pending.clear()
-    yield
-    reduce_mod._proactive_summarize_cache.clear()
-    reduce_mod._proactive_summarize_cache_pending.clear()

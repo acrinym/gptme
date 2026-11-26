@@ -141,7 +141,8 @@ def sync_events(logdir: Path) -> None:
     with _event_log_lock(logdir):
         path = _event_log_path(logdir)
         if path.exists():
-            with path.open("rb") as file:
+            # Windows os.fsync requires a writable handle (FlushFileBuffers).
+            with path.open("r+b") as file:
                 os.fsync(file.fileno())
 
 

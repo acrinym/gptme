@@ -151,6 +151,23 @@ def test_redirect_background_stdin_before_ampersand():
     )
 
 
+def test_redirect_background_stdin_grammar_gap_returns_unchanged(monkeypatch):
+    """On a tree-sitter grammar gap the command is returned unchanged."""
+    from gptme.tools import shell
+
+    class FakeNode:
+        type = "program"
+        has_error = True
+
+    monkeypatch.setattr(shell, "_parse_bash", lambda source: FakeNode())
+    assert (
+        shell._redirect_background_stdin("some-weird-grammar-gap-command &")
+        == "some-weird-grammar-gap-command &"
+    )
+    assert shell._redirect_background_stdin("weird & gap") == "weird & gap"
+    assert shell._redirect_background_stdin("weird &&") == "weird &&"
+
+
 def test_heredoc_complex(shell):
     # Test nested heredocs
     ret, out, err = shell.run(
@@ -455,15 +472,20 @@ def test_split_commands_syntax_error_uses_bash_message():
         split_commands("ls |")
 
 
-def test_split_commands_without_bash_rejects_invalid_syntax(monkeypatch):
-    """A parser error still fails closed when Bash is unavailable."""
-    import pytest
+def test_split_commands_without_bash_returns_script_on_parse_error(monkeypatch):
+    """Without bash, tree-sitter errors are treated as unparseable, not invalid.
 
+    When bash is unavailable, ``bash -n`` cannot confirm whether a tree-sitter
+    error is a real syntax error or a valid-but-unparseable construct.  The safe
+    fallback is to return the script as a single command (matching the old bashlex
+    behaviour) rather than raising ValueError, which would incorrectly reject
+    valid scripts on systems without bash.
+    """
     from gptme.tools import shell as shell_module
 
     monkeypatch.setattr(shell_module.shutil, "which", lambda _name: None)
-    with pytest.raises(ValueError, match="Shell syntax error: unexpected EOF"):
-        split_commands("ls |")
+    # tree-sitter sees an error in "ls |" but without bash we cannot confirm it
+    assert split_commands("ls |") == ["ls |"]
 
 
 def test_split_commands_windows_with_bash_keeps_stop_on_failure(monkeypatch):
@@ -1064,6 +1086,59 @@ def test_is_denylisted_pattern_matches():
         assert is_denied, f"Pattern-matching command should be denied: {cmd}"
         assert reason is not None, f"Should have reason for: {cmd}"
         assert matched_cmd is not None, f"Should have matched command for: {cmd}"
+
+
+def test_denied_compound_command_says_nothing_executed(tmp_path, monkeypatch):
+    """A denied pattern rejects the whole chain; the message must say so.
+
+    With ``touch marker && git reflog expire``, normal shell semantics would
+    have run ``touch`` first. The model must not assume that happened.
+    """
+    from gptme.tools.shell import execute_shell
+    from gptme.tools.shell_validation import NOT_EXECUTED_NOTE
+
+    # Hermetic: the denylist check must not depend on whether shellcheck
+    # is installed on the test machine.
+    monkeypatch.setattr(
+        shell_module, "check_with_shellcheck", lambda cmd: (False, False, "")
+    )
+    marker = tmp_path / "marker"
+    cmd = f"touch {marker} && git reflog expire --all"
+    messages = list(execute_shell(None, None, {"command": cmd}))
+
+    assert not marker.exists()
+    denial = messages[-1].content
+    assert denial.startswith("Command denied: `git reflog expire`")
+    assert denial.endswith(NOT_EXECUTED_NOTE)
+
+
+def test_shellcheck_block_says_nothing_executed(monkeypatch):
+    """A blocking shellcheck result is a denial too and gets the same note."""
+    from gptme.tools.shell import execute_shell
+    from gptme.tools.shell_validation import NOT_EXECUTED_NOTE
+
+    monkeypatch.setattr(
+        shell_module,
+        "check_with_shellcheck",
+        lambda cmd: (True, True, "Shellcheck found critical issues"),
+    )
+    messages = list(execute_shell(None, None, {"command": "echo a && echo b"}))
+    assert len(messages) == 1
+    assert messages[0].content.endswith(NOT_EXECUTED_NOTE)
+
+
+def test_shellcheck_warning_has_no_denial_note(monkeypatch):
+    """Non-blocking shellcheck warnings still run the command: no note."""
+    from gptme.tools.shell import execute_shell
+    from gptme.tools.shell_validation import NOT_EXECUTED_NOTE
+
+    monkeypatch.setattr(
+        shell_module,
+        "check_with_shellcheck",
+        lambda cmd: (True, False, "Shellcheck found potential issues"),
+    )
+    messages = list(execute_shell(None, None, {"command": "echo hi"}))
+    assert all(NOT_EXECUTED_NOTE not in m.content for m in messages)
 
 
 def test_is_denylisted_git_bulk_operations():
@@ -1906,7 +1981,6 @@ def test_bg_text_is_plain_bash_not_an_overlay():
     ("command", "handler"),
     [
         ("jobs", "execute_jobs_command"),
-        ("output 7", "execute_output_command"),
         ("wait 7", "execute_wait_command"),
         ("kill 7", "execute_kill_command"),
     ],
@@ -2168,6 +2242,20 @@ def test_shell_forgets_cwd_when_marker_is_lost(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def subagent_tools(monkeypatch):
+    """Make ``subagent()`` callable from in-process ipython, as the hint requires."""
+    from gptme.tools import python as python_module
+    from gptme.tools import set_tools
+    from gptme.tools.shell import tool as shell_tool
+    from gptme.tools.subagent import subagent
+    from gptme.tools.subagent import tool as subagent_tool
+
+    set_tools([shell_tool, python_module.tool, subagent_tool])
+    monkeypatch.setitem(python_module.registered_functions, "subagent", subagent)
+    monkeypatch.delenv("GPTME_SANDBOX", raising=False)
+
+
 def test_check_workspace_config_no_gptme_toml(tmp_path):
     """Returns None when there is no gptme.toml in the directory."""
     from gptme.tools.shell import _check_workspace_config
@@ -2196,7 +2284,7 @@ def test_check_workspace_config_returns_none_if_cwd_lookup_fails(monkeypatch):
     assert _check_workspace_config() is None
 
 
-def test_check_workspace_config_with_gptme_toml(tmp_path):
+def test_check_workspace_config_with_gptme_toml(tmp_path, subagent_tools):
     """Returns a hint Message when gptme.toml exists in the current directory."""
     from gptme.tools.shell import _check_workspace_config, _hinted_workspaces
 
@@ -2218,8 +2306,10 @@ def test_check_workspace_config_with_gptme_toml(tmp_path):
         os.chdir(original_cwd)
 
 
-def test_check_workspace_config_hint_includes_workspace_name(tmp_path):
-    """The suggestion uses the workspace directory name as the agent_id."""
+def test_check_workspace_config_hint_does_not_use_dir_name_as_agent_id(
+    tmp_path, subagent_tools
+):
+    """The directory name is not passed as the agent_id (it reads like an agent name)."""
     from gptme.tools.shell import _check_workspace_config, _hinted_workspaces
 
     workspace = tmp_path / "my-project"
@@ -2232,12 +2322,103 @@ def test_check_workspace_config_hint_includes_workspace_name(tmp_path):
         _hinted_workspaces.discard(str(workspace.resolve()))
         result = _check_workspace_config()
         assert result is not None
-        assert "my-project" in result.content
+        assert 'subagent("my-project"' not in result.content
+        assert 'subagent("workspace-task"' in result.content
     finally:
         os.chdir(original_cwd)
+        _hinted_workspaces.discard(str(workspace.resolve()))
 
 
-def test_check_workspace_config_hints_only_once_per_workspace(tmp_path):
+def _assert_no_workspace_hint(workspace: Path) -> None:
+    from gptme.tools.shell import _check_workspace_config, _hinted_workspaces
+
+    (workspace / "gptme.toml").write_text("[gptme]\n")
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(workspace)
+        _hinted_workspaces.discard(str(workspace.resolve()))
+        assert _check_workspace_config() is None
+        assert str(workspace.resolve()) not in _hinted_workspaces
+    finally:
+        os.chdir(original_cwd)
+        _hinted_workspaces.discard(str(workspace.resolve()))
+
+
+def test_check_workspace_config_no_hint_when_subagent_not_registered(
+    tmp_path, subagent_tools, monkeypatch
+):
+    """Both tools loaded but subagent() not in ipython's namespace: no hint."""
+    from gptme.tools import python as python_module
+
+    monkeypatch.delitem(python_module.registered_functions, "subagent")
+    _assert_no_workspace_hint(tmp_path)
+
+
+@pytest.mark.parametrize("backend", ["docker", "wasmtime"])
+def test_check_workspace_config_no_hint_in_python_sandbox(
+    tmp_path, subagent_tools, monkeypatch, backend
+):
+    """Sandboxed Python backends don't expose host functions like subagent()."""
+    monkeypatch.setenv("GPTME_SANDBOX", backend)
+    # The real shell session refuses to start when the sandbox backend is
+    # missing on this machine; only its cwd matters here.
+    monkeypatch.setattr(
+        shell_module, "get_shell", lambda: Mock(get_cwd=lambda: tmp_path)
+    )
+    _assert_no_workspace_hint(tmp_path)
+
+
+@pytest.mark.parametrize("loaded", [[], ["shell"], ["shell", "subagent"]])
+def test_check_workspace_config_no_hint_without_subagent(tmp_path, loaded):
+    """No subagent() suggestion unless subagent and ipython are both loaded.
+
+    Suggesting the call otherwise makes the agent hit ``NameError: name
+    'subagent' is not defined``. A suppressed hint must not consume the
+    once-per-workspace slot.
+    """
+    from gptme.tools import get_available_tools, set_tools
+    from gptme.tools.shell import _check_workspace_config, _hinted_workspaces
+
+    (tmp_path / "gptme.toml").write_text("[gptme]\n")
+    set_tools([t for t in get_available_tools() if t.name in loaded])
+
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        _hinted_workspaces.discard(str(tmp_path.resolve()))
+        assert _check_workspace_config() is None
+        assert str(tmp_path.resolve()) not in _hinted_workspaces
+    finally:
+        os.chdir(original_cwd)
+        _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+
+def test_workspace_hint_shown_once_across_commands(tmp_path, subagent_tools):
+    """Repeated cds into the same workspace only show the hint the first time."""
+    from gptme.tools.shell import _hinted_workspaces, execute_shell
+
+    (tmp_path / "gptme.toml").write_text("[gptme]\n")
+    _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+    original_cwd = os.getcwd()
+    ctx = _isolate_shell_context()
+    try:
+        outputs = [
+            "".join(
+                m.content
+                for m in execute_shell(None, None, {"command": f"cd {tmp_path}"})
+            )
+            for _ in range(3)
+        ]
+    finally:
+        os.chdir(original_cwd)
+        _restore_shell_context(*ctx)
+        _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+    assert ["Workspace detected" in out for out in outputs] == [True, False, False]
+
+
+def test_check_workspace_config_hints_only_once_per_workspace(tmp_path, subagent_tools):
     """The hint fires once per workspace per session, not on every cd."""
     from gptme.tools.shell import _check_workspace_config, _hinted_workspaces
 
@@ -2258,7 +2439,7 @@ def test_check_workspace_config_hints_only_once_per_workspace(tmp_path):
         _hinted_workspaces.discard(str(tmp_path.resolve()))
 
 
-def test_check_workspace_config_hint_includes_workdir_param(tmp_path):
+def test_check_workspace_config_hint_includes_workdir_param(tmp_path, subagent_tools):
     """The workspace hint snippet includes workdir= so the subagent uses the right path."""
     from gptme.tools.shell import _check_workspace_config, _hinted_workspaces
 
@@ -2295,7 +2476,7 @@ def _restore_shell_context(ws_token, sh_token, old_shell) -> None:
     shell_module._workspace_cwd.reset(ws_token)
 
 
-def test_workspace_hint_in_command_output(tmp_path):
+def test_workspace_hint_in_command_output(tmp_path, subagent_tools):
     """Workspace hint is appended to the command output in a single message.
 
     Strict providers (e.g. Moonshot AI / kimi-k2.6) require that an assistant
@@ -2332,7 +2513,7 @@ def test_workspace_hint_in_command_output(tmp_path):
     )
 
 
-def test_workspace_hint_serializes_as_one_tool_response(tmp_path):
+def test_workspace_hint_serializes_as_one_tool_response(tmp_path, subagent_tools):
     """No message may sit between a structured call and its tool result."""
     from gptme.llm.llm_openai import _prepare_messages_for_api
     from gptme.message import Message
@@ -2385,7 +2566,9 @@ def test_workspace_hint_serializes_as_one_tool_response(tmp_path):
     assert "gptme.toml" in str(tool_result["content"])
 
 
-def test_workspace_hint_follows_shell_cwd_when_process_chdir_is_skipped(tmp_path):
+def test_workspace_hint_follows_shell_cwd_when_process_chdir_is_skipped(
+    tmp_path, subagent_tools
+):
     """Server sessions set workspace cwd and skip os.chdir; the hint must still fire."""
     from gptme.tools.shell import _hinted_workspaces, execute_shell
 

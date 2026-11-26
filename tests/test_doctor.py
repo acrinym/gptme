@@ -1,9 +1,12 @@
 """Tests for the gptme doctor command."""
 
 import json
+import sys
+import types
 from collections import UserDict
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -19,20 +22,33 @@ from gptme.cli.doctor import (
     _check_default_model,
     _check_mcp,
     _check_permissions,
+    _check_plugins,
     _check_proxy,
     _check_python_deps,
     _check_python_version,
     _check_tools,
     _check_version,
     _model_override_blocking_repair,
+    _provider_has_placeholder_key,
     _provider_repair_needed,
     _subscription_default_candidate,
+    _usable_providers,
     _validate_oauth_for_repair,
     main,
     print_results,
     run_diagnostics,
 )
 from gptme.config import Config, MCPConfig, MCPServerConfig, ModelsConfig, UserConfig
+from gptme.credentials import STORED_CREDENTIALS_SOURCE
+
+
+def _details_blob(details: str | list[str] | None) -> str:
+    """Join structured doctor details for substring assertions."""
+    if details is None:
+        return ""
+    if isinstance(details, list):
+        return "\n".join(details)
+    return details
 
 
 class TestCheckStatus:
@@ -642,6 +658,29 @@ class TestRunDiagnostics:
         assert summary["total"] == counted_total
         assert summary["total"] == len(results)
 
+    def test_plugins_checked_before_provider_diagnostics(self):
+        """Plugin providers must be registered before provider checks run."""
+        calls: list[str] = []
+
+        def check(name):
+            def _check(verbose=False):
+                calls.append(name)
+                return []
+
+            return _check
+
+        with (
+            patch("gptme.cli.doctor._check_plugins", new=check("plugins")),
+            patch("gptme.cli.doctor._check_api_keys", new=check("api_keys")),
+            patch(
+                "gptme.cli.doctor._check_default_model",
+                new=check("default_model"),
+            ),
+        ):
+            run_diagnostics()
+
+        assert calls == ["plugins", "api_keys", "default_model"]
+
 
 class TestCLI:
     """Test CLI interface."""
@@ -1011,14 +1050,14 @@ class TestCheckApiKeys:
     @patch("gptme.cli.doctor.list_available_providers")
     @patch("gptme.cli.doctor.get_config")
     @patch("gptme.cli.doctor.validate_api_key")
-    @patch.dict("os.environ", {"OPENAI_API_KEY": "sk-invalid"}, clear=True)
+    @patch.dict("os.environ", {}, clear=True)
     def test_invalid_api_key(self, mock_validate, mock_config, mock_providers):
         """Test that invalid API keys are reported as ERROR."""
 
         # Setup mocks
         mock_providers.return_value = [("openai", None)]
         mock_config_obj = mock_config.return_value
-        mock_config_obj.get_env.return_value = None
+        mock_config_obj.get_env.return_value = "sk-invalid"
         mock_validate.return_value = (False, "Invalid key format")
 
         results = _check_api_keys()
@@ -1030,6 +1069,51 @@ class TestCheckApiKeys:
         assert openai_result.status == CheckStatus.ERROR
         assert "invalid" in openai_result.message.lower()
         assert openai_result.fix_hint is not None
+
+    @patch("gptme.cli.doctor.list_available_providers")
+    @patch("gptme.cli.doctor.get_config")
+    @patch("gptme.cli.doctor.validate_api_key")
+    @patch.dict("os.environ", {}, clear=True)
+    def test_placeholder_api_key_is_skipped(
+        self, mock_validate, mock_config, mock_providers
+    ):
+        """Placeholder keys (e.g. "test", "dummy-key") are not-configured, not ERROR.
+
+        A provider is marked "available" whenever its key env var is set, so a
+        placeholder left in config would otherwise be validated against the live
+        API and fire a critical ERROR. It must be reported as SKIPPED instead.
+        """
+        mock_providers.return_value = [("anthropic", None)]
+        mock_config_obj = mock_config.return_value
+        mock_config_obj.get_env.return_value = "dummy-key"
+
+        results = _check_api_keys()
+
+        anthropic_results = [r for r in results if "anthropic" in r.name.lower()]
+        assert len(anthropic_results) >= 1
+        result = anthropic_results[0]
+        assert result.status == CheckStatus.SKIPPED
+        assert "placeholder" in result.message.lower()
+        # The placeholder must not be validated against the live API.
+        mock_validate.assert_not_called()
+
+    @patch("gptme.cli.doctor.list_available_providers")
+    @patch("gptme.cli.doctor.validate_api_key", return_value=(True, None))
+    def test_prefixed_real_key_is_not_skipped_as_placeholder(
+        self, mock_validate, mock_providers, monkeypatch
+    ):
+        """A GPTME_ prefixed real key is the runtime credential, not the bare placeholder."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test")
+        monkeypatch.setenv("GPTME_OPENAI_API_KEY", "sk-real-key-123")
+        mock_providers.return_value = [("openai", "OPENAI_API_KEY")]
+        with patch(
+            "gptme.cli.doctor.get_config", return_value=Config(user=UserConfig())
+        ):
+            results = _check_api_keys()
+
+        openai_result = next(r for r in results if r.name == "API Key: openai")
+        assert openai_result.status == CheckStatus.OK
+        mock_validate.assert_called_once_with("sk-real-key-123", "openai")
 
     @patch("gptme.cli.doctor.list_available_providers")
     @patch("gptme.cli.doctor.get_config")
@@ -1100,14 +1184,18 @@ class TestCheckApiKeys:
 
     @patch("gptme.cli.doctor.list_available_providers")
     @patch("gptme.cli.doctor.get_config")
-    @patch.dict("os.environ", {"AZURE_OPENAI_API_KEY": "test-key"}, clear=True)
+    @patch.dict("os.environ", {}, clear=True)
     def test_azure_uses_special_env_var(self, mock_config, mock_providers):
         """Test that Azure uses AZURE_OPENAI_API_KEY (special case)."""
 
         # Setup: azure provider available
         mock_providers.return_value = [("azure", None)]
         mock_config_obj = mock_config.return_value
-        mock_config_obj.get_env.return_value = None
+
+        def get_env(key, default=None):
+            return "test-key" if key == "AZURE_OPENAI_API_KEY" else default
+
+        mock_config_obj.get_env.side_effect = get_env
 
         with patch("gptme.cli.doctor.validate_api_key") as mock_validate:
             mock_validate.return_value = (True, None)
@@ -1157,7 +1245,7 @@ class TestCheckApiKeys:
     @patch("gptme.cli.doctor.list_available_providers")
     @patch("gptme.cli.doctor.get_config")
     @patch("gptme.cli.doctor.validate_api_key")
-    @patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test123"}, clear=True)
+    @patch.dict("os.environ", {}, clear=True)
     def test_mixed_api_and_oauth_providers(
         self, mock_validate, mock_config, mock_providers
     ):
@@ -1166,7 +1254,7 @@ class TestCheckApiKeys:
             ("openai", "OPENAI_API_KEY"),
             ("openai-subscription", "oauth"),
         ]
-        mock_config.return_value.get_env.return_value = None
+        mock_config.return_value.get_env.return_value = "sk-test123"
         mock_validate.return_value = (True, "")
 
         results = _check_api_keys()
@@ -1347,6 +1435,163 @@ class TestCheckDefaultModel:
         assert result.status == CheckStatus.ERROR
         assert "Unknown provider 'openaix'" in result.message
 
+    @patch(
+        "gptme.cli.doctor.resolve_model_source",
+        return_value=("anthropic/claude-sonnet-4-6", "models.default"),
+    )
+    @patch(
+        "gptme.cli.doctor.list_available_providers",
+        return_value=[("anthropic", "ANTHROPIC_API_KEY")],
+    )
+    @patch("gptme.cli.doctor.get_config")
+    def test_placeholder_only_provider_is_not_usable(
+        self, mock_config, mock_providers, mock_resolve, monkeypatch
+    ):
+        """A provider whose only key is a placeholder must not report the default as OK."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        mock_config.return_value.get_env.return_value = "test"
+
+        result = _check_default_model()[0]
+
+        assert result.status == CheckStatus.ERROR
+        assert "anthropic" in result.message
+
+    @patch(
+        "gptme.cli.doctor.resolve_model_source",
+        return_value=("anthropic/claude-sonnet-4-6", "models.default"),
+    )
+    @patch(
+        "gptme.cli.doctor.list_available_providers",
+        return_value=[("anthropic", "ANTHROPIC_API_KEY")],
+    )
+    @patch("gptme.cli.doctor.get_config")
+    def test_real_key_provider_is_still_usable(
+        self, mock_config, mock_providers, mock_resolve, monkeypatch
+    ):
+        """A non-placeholder key keeps the provider usable (no over-classification)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        mock_config.return_value.get_env.return_value = "sk-ant-real-key-123"
+
+        result = _check_default_model()[0]
+
+        assert result.status == CheckStatus.OK
+        assert result.provider == "anthropic"
+
+    @patch(
+        "gptme.cli.doctor.resolve_model_source",
+        return_value=("openai/gpt-4o", "models.default"),
+    )
+    @patch(
+        "gptme.cli.doctor.list_available_providers",
+        return_value=[("openai", "OPENAI_API_KEY")],
+    )
+    def test_prefixed_real_key_wins_over_bare_placeholder(
+        self, mock_providers, mock_resolve, monkeypatch
+    ):
+        """GPTME_OPENAI_API_KEY is the runtime key; a bare placeholder must not hide it."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test")
+        monkeypatch.setenv("GPTME_OPENAI_API_KEY", "sk-real-key-123")
+        config = Config(user=UserConfig())
+        with patch("gptme.cli.doctor.get_config", return_value=config):
+            result = _check_default_model()[0]
+
+        assert result.status == CheckStatus.OK
+        assert result.provider == "openai"
+
+    @patch(
+        "gptme.cli.doctor.resolve_model_source",
+        return_value=("openai-subscription/gpt-5.4", "models.default"),
+    )
+    @patch(
+        "gptme.cli.doctor.list_available_providers",
+        return_value=[("openai-subscription", "oauth")],
+    )
+    def test_oauth_provider_not_filtered_by_placeholder_api_key(
+        self, mock_providers, mock_resolve, monkeypatch
+    ):
+        """OAuth login stays usable even if a derived API-key name holds a placeholder."""
+        monkeypatch.setenv("OPENAI-SUBSCRIPTION_API_KEY", "test")
+        config = Config(user=UserConfig())
+        with patch("gptme.cli.doctor.get_config", return_value=config):
+            result = _check_default_model()[0]
+
+        assert result.status == CheckStatus.OK
+        assert result.provider == "openai-subscription"
+
+
+class TestProviderPlaceholderFilter:
+    """Unit tests for credential-source-aware placeholder filtering."""
+
+    def test_plugin_source_env_var_is_used_not_derived_name(self, monkeypatch):
+        """A plugin's actual key source wins over a placeholder under the derived name."""
+        monkeypatch.setenv("ACME_API_KEY", "test")
+        monkeypatch.setenv("ACME_CUSTOM_KEY", "sk-real-plugin-key")
+        config = Config(user=UserConfig())
+        assert not _provider_has_placeholder_key("acme", "ACME_CUSTOM_KEY", config)
+
+    def test_plugin_placeholder_source_is_unusable(self, monkeypatch):
+        monkeypatch.delenv("ACME_CUSTOM_KEY", raising=False)
+        monkeypatch.delenv("GPTME_ACME_CUSTOM_KEY", raising=False)
+        config = Config(user=UserConfig(env={"ACME_CUSTOM_KEY": "dummy-key"}))
+        assert _provider_has_placeholder_key("acme", "ACME_CUSTOM_KEY", config)
+
+    def test_oauth_source_is_never_a_placeholder(self, monkeypatch):
+        monkeypatch.setenv("OPENAI-SUBSCRIPTION_API_KEY", "test")
+        config = Config(user=UserConfig())
+        assert not _provider_has_placeholder_key("openai-subscription", "oauth", config)
+
+    @patch(
+        "gptme.cli.doctor.list_available_providers",
+        return_value=[("openai-subscription", "oauth")],
+    )
+    def test_usable_providers_keeps_oauth_with_stale_placeholder(
+        self, mock_providers, monkeypatch
+    ):
+        monkeypatch.setenv("OPENAI-SUBSCRIPTION_API_KEY", "test")
+        config = Config(user=UserConfig())
+        assert ("openai-subscription", "oauth") in _usable_providers(config)
+
+    @patch(
+        "gptme.cli.doctor.get_plugin_api_keys",
+        return_value={"acme": "ACME_CUSTOM_KEY"},
+    )
+    @patch("gptme.cli.doctor.get_stored_api_key", return_value="test")
+    def test_stored_placeholder_does_not_hide_plugin_env_key(
+        self, mock_stored, mock_plugin_keys, monkeypatch
+    ):
+        """Discovery may label a plugin as stored; runtime still uses api_key_env."""
+        monkeypatch.setenv("ACME_CUSTOM_KEY", "sk-real-plugin-key")
+        config = Config(user=UserConfig())
+        assert not _provider_has_placeholder_key(
+            "acme", STORED_CREDENTIALS_SOURCE, config
+        )
+
+    @patch(
+        "gptme.cli.doctor.list_available_providers",
+        return_value=[("acme", STORED_CREDENTIALS_SOURCE)],
+    )
+    @patch(
+        "gptme.cli.doctor.get_plugin_api_keys",
+        return_value={"acme": "ACME_CUSTOM_KEY"},
+    )
+    @patch("gptme.cli.doctor.get_stored_api_key", return_value="test")
+    def test_usable_providers_keeps_plugin_env_over_stored_placeholder(
+        self, mock_stored, mock_plugin_keys, mock_providers, monkeypatch
+    ):
+        monkeypatch.setenv("ACME_CUSTOM_KEY", "sk-real-plugin-key")
+        config = Config(user=UserConfig())
+        assert ("acme", STORED_CREDENTIALS_SOURCE) in _usable_providers(config)
+
+    @patch("gptme.cli.doctor.get_plugin_api_keys", return_value={})
+    @patch("gptme.cli.doctor.get_stored_api_key", return_value="test")
+    def test_stored_placeholder_only_is_unusable(
+        self, mock_stored, mock_plugin_keys, monkeypatch
+    ):
+        monkeypatch.delenv("ACME_API_KEY", raising=False)
+        monkeypatch.delenv("GPTME_ACME_API_KEY", raising=False)
+        config = Config(user=UserConfig())
+        assert _provider_has_placeholder_key("acme", STORED_CREDENTIALS_SOURCE, config)
+
 
 class TestOAuthRepairValidation:
     """Test OAuth health validation used by interactive repair."""
@@ -1465,6 +1710,23 @@ class TestProviderRepairNeeded:
         results = [
             CheckResult("API Key: openai", CheckStatus.ERROR, "Invalid key"),
             CheckResult("Model: Default", CheckStatus.OK, "openai/gpt-5.4"),
+        ]
+        assert _provider_repair_needed(results)
+
+    def test_placeholder_only_default_needs_repair(self):
+        """A placeholder key must leave repair offered, not just the API-key check skipped."""
+        results = [
+            CheckResult(
+                "API Key: anthropic",
+                CheckStatus.SKIPPED,
+                "Not configured (placeholder key)",
+            ),
+            CheckResult(
+                "Model: Default",
+                CheckStatus.ERROR,
+                "Provider 'anthropic' is not configured",
+                provider="anthropic",
+            ),
         ]
         assert _provider_repair_needed(results)
 
@@ -2033,3 +2295,897 @@ class TestCheckComputer:
         assert names["Computer: ffmpeg"].status == CheckStatus.WARNING
         hint = names["Computer: ffmpeg"].fix_hint or ""
         assert "brew install ffmpeg" in hint
+
+
+class TestCheckPlugins:
+    """Test _check_plugins function — structured JSON verdict per plugin."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_plugin_allowlist(self, monkeypatch):
+        """Doctor consults plugins.enabled; tests default to 'all enabled'."""
+        monkeypatch.setattr(
+            Config,
+            "get_plugin_config",
+            lambda self: ([], None),
+        )
+
+    def test_no_plugins_returns_ok(self):
+        """When no plugins are registered, return a single OK result."""
+        with patch("importlib.metadata.entry_points", return_value=[]):
+            results = _check_plugins()
+        assert len(results) == 1
+        assert results[0].name == "Plugin: installed"
+        assert results[0].status == CheckStatus.OK
+        assert "No plugins" in results[0].message
+
+    def test_discovery_error_returns_error(self):
+        """An exception from entry_points() produces an ERROR result."""
+        with patch(
+            "importlib.metadata.entry_points", side_effect=Exception("import boom")
+        ):
+            results = _check_plugins()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.ERROR
+        assert "discovery" in results[0].name.lower()
+
+    def test_healthy_plugin_reports_ok(self):
+        """A plugin whose tools all pass init() is reported as OK."""
+        from gptme.tools.base import ToolSpec
+
+        good_tool = ToolSpec(
+            name="good_tool",
+            desc="works",
+            init=lambda: ToolSpec(name="good_tool", desc="works"),
+        )
+
+        from gptme.plugins.plugin import GptmePlugin
+
+        good_plugin = GptmePlugin(name="test_plugin", tools=[good_tool])
+
+        ep = SimpleNamespace(name="test_plugin", load=lambda: good_plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: test_plugin")
+        assert plugin_result.status == CheckStatus.OK
+        assert "1 tool(s) ok" in plugin_result.message
+        # details always has per-tool verdicts for JSON consumers
+        assert plugin_result.details is not None
+        assert "good_tool:ok" in _details_blob(plugin_result.details)
+
+    def test_broken_tool_init_reports_error(self):
+        """A plugin with a tool whose init() raises is reported as ERROR."""
+        from gptme.tools.base import ToolSpec
+
+        def _broken_init():
+            raise RuntimeError("plugin wiring failed")
+
+        bad_tool = ToolSpec(name="bad_tool", desc="broken", init=_broken_init)
+
+        from gptme.plugins.plugin import GptmePlugin
+
+        bad_plugin = GptmePlugin(name="broken_plugin", tools=[bad_tool])
+
+        ep = SimpleNamespace(name="broken_plugin", load=lambda: bad_plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: broken_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "failed" in plugin_result.message
+        assert plugin_result.details is not None
+        assert "bad_tool:error" in _details_blob(plugin_result.details)
+
+    def test_wrong_return_type_reports_error(self):
+        """init() returning a non-ToolSpec is flagged as a contract violation."""
+        from gptme.tools.base import ToolSpec
+
+        bad_tool = ToolSpec(
+            name="wrong_return",
+            desc="returns None",
+            init=lambda: None,  # type: ignore[arg-type,return-value]
+        )
+
+        from gptme.plugins.plugin import GptmePlugin
+
+        plugin = GptmePlugin(name="wrong_plugin", tools=[bad_tool])
+        ep = SimpleNamespace(name="wrong_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: wrong_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert plugin_result.details is not None
+        assert "NoneType" in _details_blob(plugin_result.details)
+
+    def test_import_failure_reports_error(self):
+        """A plugin whose entry point raises on load() produces an ERROR."""
+        ep = SimpleNamespace(
+            name="boom_plugin",
+            load=lambda: (_ for _ in ()).throw(ImportError("missing dep")),
+        )
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: boom_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "Import failed" in plugin_result.message
+
+    def test_malicious_plugin_is_blocked_before_import(self, tmp_path):
+        """Static malware findings must prevent executing the entry point."""
+
+        class FakeDistribution:
+            name = "dangerous-plugin"
+            files = [Path("dangerous_plugin/__init__.py")]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        plugin_file = tmp_path / "dangerous_plugin" / "__init__.py"
+        plugin_file.parent.mkdir()
+        plugin_file.write_text(
+            "secret = open('~/.ssh/id_rsa').read()\n",
+            encoding="utf-8",
+        )
+        load = Mock(side_effect=AssertionError("malicious plugin was imported"))
+        ep = SimpleNamespace(
+            name="dangerous_plugin",
+            module="dangerous_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: dangerous_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "Security scan blocked import" in plugin_result.message
+        assert "credential-harvest" in _details_blob(plugin_result.details)
+
+    def test_clean_plugin_security_scan_allows_import(self, tmp_path):
+        """Clean third-party source is scanned and then loaded normally."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        class FakeDistribution:
+            name = "clean-plugin"
+            files = [Path("clean_plugin/__init__.py")]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        plugin_file = tmp_path / "clean_plugin" / "__init__.py"
+        plugin_file.parent.mkdir()
+        plugin_file.write_text("VALUE = 42\n", encoding="utf-8")
+        load = Mock(return_value=GptmePlugin(name="clean_plugin"))
+        ep = SimpleNamespace(
+            name="clean_plugin",
+            module="clean_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_called_once_with()
+        plugin_result = next(r for r in results if r.name == "Plugin: clean_plugin")
+        assert plugin_result.status == CheckStatus.OK
+        assert "security:ok(1 files scanned)" in _details_blob(plugin_result.details)
+
+    def test_tool_without_init_reports_ok(self):
+        """A tool with no init() callable is OK — no contract to violate."""
+        from gptme.tools.base import ToolSpec
+
+        no_init_tool = ToolSpec(name="static_tool", desc="no init needed")
+
+        from gptme.plugins.plugin import GptmePlugin
+
+        plugin = GptmePlugin(name="static_plugin", tools=[no_init_tool])
+        ep = SimpleNamespace(name="static_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: static_plugin")
+        assert plugin_result.status == CheckStatus.OK
+        assert plugin_result.details is not None
+        assert "no-init" in _details_blob(plugin_result.details)
+
+    def test_hook_and_command_registrars_report_ok_without_leaking(self):
+        """Valid registrar callbacks are checked in isolated registries."""
+        from collections.abc import Generator
+
+        from gptme.commands.base import CommandContext, register_command
+        from gptme.hooks import HookType, get_hooks, register_hook
+        from gptme.logmanager import LogManager
+        from gptme.message import Message
+        from gptme.plugins.plugin import GptmePlugin
+
+        def _hook(_manager: LogManager) -> Generator[Message, None, None]:
+            yield from ()
+
+        def _cmd(_ctx: CommandContext) -> Generator[Message, None, None]:
+            yield from ()
+
+        def register_hooks() -> None:
+            register_hook(
+                "doctor-test-hook",
+                HookType.STEP_PRE,
+                _hook,  # type: ignore[call-overload]
+            )
+
+        def register_commands() -> None:
+            register_command("doctor-test-command", _cmd)
+
+        plugin = GptmePlugin(
+            name="registrar_plugin",
+            register_hooks=register_hooks,
+            register_commands=register_commands,
+        )
+        ep = SimpleNamespace(name="registrar_plugin", load=lambda: plugin)
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: registrar_plugin")
+        assert plugin_result.status == CheckStatus.OK
+        assert plugin_result.details is not None
+        blob = _details_blob(plugin_result.details)
+        assert "hooks:ok(1 registered)" in blob
+        assert "commands:ok(1 registered)" in blob
+        assert all(hook.name != "doctor-test-hook" for hook in get_hooks())
+
+        from gptme.commands.base import get_registered_commands
+
+        assert "doctor-test-command" not in get_registered_commands()
+
+    def test_hook_registrar_wrong_return_type_is_attributed(self):
+        """A hook registrar returning a value violates its None contract."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        plugin = GptmePlugin(
+            name="bad_hook_plugin",
+            register_hooks=lambda: "unexpected",  # type: ignore[arg-type]
+        )
+        ep = SimpleNamespace(name="bad_hook_plugin", load=lambda: plugin)
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: bad_hook_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert plugin_result.details is not None
+        assert "hooks:error(register_hooks() returned str, expected None)" in (
+            _details_blob(plugin_result.details)
+        )
+
+    def test_command_registrar_exception_is_attributed(self):
+        """A command registrar exception names the failing capability."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        def register_commands() -> None:
+            raise RuntimeError("broken command wiring")
+
+        plugin = GptmePlugin(
+            name="bad_command_plugin", register_commands=register_commands
+        )
+        ep = SimpleNamespace(name="bad_command_plugin", load=lambda: plugin)
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(
+            r for r in results if r.name == "Plugin: bad_command_plugin"
+        )
+        assert plugin_result.status == CheckStatus.ERROR
+        assert plugin_result.details is not None
+        assert "commands:error(RuntimeError: broken command wiring)" in (
+            _details_blob(plugin_result.details)
+        )
+
+    def test_tool_modules_broken_init_is_checked(self, monkeypatch):
+        """Tools supplied via tool_modules must be validated, not reported as no-tools."""
+        from gptme.plugins.plugin import GptmePlugin
+        from gptme.tools.base import ToolSpec
+
+        def _broken_init():
+            raise RuntimeError("module tool broken")
+
+        fake = types.ModuleType("fake_doctor_plugin_tools")
+        fake.__dict__["tool"] = ToolSpec(
+            name="mod_tool", desc="from module", init=_broken_init
+        )
+        monkeypatch.setitem(sys.modules, fake.__name__, fake)
+
+        plugin = GptmePlugin(
+            name="mod_plugin", tool_modules=["fake_doctor_plugin_tools"]
+        )
+        ep = SimpleNamespace(name="mod_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: mod_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "mod_tool:error" in _details_blob(plugin_result.details)
+        assert "no tools" not in plugin_result.message
+
+    def test_tool_module_discover_exception_does_not_abort_doctor(self):
+        """A spec-collection error is a plugin verdict, not a doctor crash."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        plugin = GptmePlugin(
+            name="discover_boom_plugin",
+            tool_modules=["gptme.tools.save"],
+        )
+        ep = SimpleNamespace(name="discover_boom_plugin", load=lambda: plugin)
+        with (
+            patch("importlib.metadata.entry_points", return_value=[ep]),
+            patch(
+                "gptme.tools._iter_tool_specs",
+                side_effect=ImportError("submodule exploded"),
+            ),
+        ):
+            results = _check_plugins()
+
+        plugin_result = next(
+            r for r in results if r.name == "Plugin: discover_boom_plugin"
+        )
+        assert plugin_result.status == CheckStatus.ERROR
+        blob = _details_blob(plugin_result.details)
+        assert "discover ImportError: submodule exploded" in blob
+
+    def test_tool_module_sibling_verdicts_survive_submodule_error(
+        self, tmp_path, monkeypatch
+    ):
+        """A broken submodule must not discard healthy siblings' verdicts."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        pkg = tmp_path / "sibling_broken_pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "good.py").write_text(
+            "from gptme.tools.base import ToolSpec\n"
+            "GOOD_TOOL = ToolSpec(name='sibling_good', desc='ok')\n"
+        )
+        (pkg / "bad.py").write_text("raise ImportError('sibling exploded')\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.delitem(sys.modules, "sibling_broken_pkg", raising=False)
+
+        plugin = GptmePlugin(name="sibling_plugin", tool_modules=["sibling_broken_pkg"])
+        ep = SimpleNamespace(name="sibling_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: sibling_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        blob = _details_blob(plugin_result.details)
+        # Healthy sibling is still reported...
+        assert "sibling_good:ok(no-init)" in blob
+        # ...and the failing one is attributed to its own submodule.
+        assert "sibling_broken_pkg.bad:error(import ImportError" in blob
+
+    def test_tool_module_import_failure_is_error(self):
+        """A missing tool_modules entry is an error, not a healthy empty plugin."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        plugin = GptmePlugin(
+            name="missing_mod_plugin",
+            tool_modules=["gptme_doctor_no_such_module"],
+        )
+        ep = SimpleNamespace(name="missing_mod_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(
+            r for r in results if r.name == "Plugin: missing_mod_plugin"
+        )
+        assert plugin_result.status == CheckStatus.ERROR
+        blob = _details_blob(plugin_result.details)
+        assert "gptme_doctor_no_such_module:error(import" in blob
+
+    def test_verdict_details_stay_structured_when_error_contains_delimiter(self):
+        """Per-item verdicts must not be joined with a delimiter that error text can contain."""
+        from gptme.plugins.plugin import GptmePlugin
+        from gptme.tools.base import ToolSpec
+
+        def _broken_init():
+            raise RuntimeError("left | right")
+
+        plugin = GptmePlugin(
+            name="pipe_plugin",
+            tools=[
+                ToolSpec(name="pipe_tool", desc="broken", init=_broken_init),
+                ToolSpec(name="ok_tool", desc="fine"),
+            ],
+        )
+        ep = SimpleNamespace(name="pipe_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: pipe_plugin")
+        details = plugin_result.details
+        assert isinstance(details, list)
+        assert len(details) == 2
+        assert any(
+            item.startswith("pipe_tool:error") and "left | right" in item
+            for item in details
+        )
+        assert "ok_tool:ok(no-init)" in details
+
+    def test_json_output_includes_plugin_details(self):
+        """gptme-doctor --json includes per-plugin details in the output."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        empty_plugin = GptmePlugin(name="empty_plugin", tools=[])
+        ep = SimpleNamespace(name="empty_plugin", load=lambda: empty_plugin)
+
+        runner = CliRunner()
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            result = runner.invoke(main, ["--json"])
+
+        # exit code reflects overall health; we only care that JSON is valid
+        assert result.output, "expected JSON output"
+        data = json.loads(result.output)
+        plugin_results = [r for r in data["results"] if r["name"].startswith("Plugin:")]
+        assert any(r["name"] == "Plugin: empty_plugin" for r in plugin_results)
+
+    def test_security_scan_error_is_a_plugin_verdict(self):
+        """A distribution whose metadata raises must not abort the doctor run."""
+
+        class ExplodingDistribution:
+            name = "boom-metadata"
+
+            @property
+            def files(self):
+                raise RuntimeError("bad metadata")
+
+        load = Mock(side_effect=AssertionError("unverified plugin imported"))
+        ep = SimpleNamespace(
+            name="boom_metadata",
+            module="boom_metadata",
+            dist=ExplodingDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: boom_metadata")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "Security scan failed" in plugin_result.message
+
+    def test_unscanned_entry_point_blocks_import(self, tmp_path):
+        """A module skipped by the scan must not be reported as verified."""
+        from gptme.plugins.security import _MAX_FILE_BYTES
+
+        plugin_root = tmp_path / "unscanned_plugin"
+        plugin_root.mkdir()
+        (plugin_root / "other.py").write_text("VALUE = 1\n", encoding="utf-8")
+        oversized = plugin_root / "entry.py"
+        oversized.write_bytes(b"VALUE = 2\n" + b"x" * (_MAX_FILE_BYTES + 1))
+
+        class FakeDistribution:
+            name = "sneaky-plugin"
+            files = [
+                Path("unscanned_plugin/entry.py"),
+                Path("unscanned_plugin/other.py"),
+            ]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        load = Mock(side_effect=AssertionError("unverified plugin imported"))
+        ep = SimpleNamespace(
+            name="sneaky_plugin",
+            module="unscanned_plugin.entry",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: sneaky_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "could not verify entry point" in plugin_result.message
+        assert "security:ok" not in _details_blob(plugin_result.details)
+
+    def test_benign_env_example_is_not_flagged(self, tmp_path):
+        """Template reads and comment text must not trip the credential pattern."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        class FakeDistribution:
+            name = "benign-plugin"
+            files = [Path("benign_plugin/__init__.py")]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        plugin_file = tmp_path / "benign_plugin" / "__init__.py"
+        plugin_file.parent.mkdir()
+        plugin_file.write_text(
+            "EXAMPLE = \"open('.env.example')\"\n"
+            "# open('~/.ssh/id_rsa')  # illustrative comment\n"
+            "VALUE = 1  # open('~/.ssh/id_rsa')\n",
+            encoding="utf-8",
+        )
+        load = Mock(return_value=GptmePlugin(name="benign_plugin"))
+        ep = SimpleNamespace(
+            name="benign_plugin",
+            module="benign_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_called_once_with()
+        plugin_result = next(r for r in results if r.name == "Plugin: benign_plugin")
+        assert plugin_result.status == CheckStatus.OK
+
+    def test_missing_file_list_is_unverified_not_imported(self):
+        """A third-party dist without a file list must fail closed, not import."""
+
+        class FakeDistribution:
+            name = "no-record-plugin"
+            files = None
+
+            def locate_file(self, path):
+                return path
+
+        load = Mock(side_effect=AssertionError("unscanned plugin imported"))
+        ep = SimpleNamespace(
+            name="no_record_plugin",
+            module="no_record_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: no_record_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "could not verify entry point" in plugin_result.message
+
+    def test_editable_install_scans_source_module(self, tmp_path):
+        """An editable install (pip install -e .) must not be marked unverified.
+
+        The documented plugin workflow lists only the editable shim in ``files``,
+        so the entry-point module is found via ``direct_url.json`` instead.
+        """
+        from gptme.plugins.plugin import GptmePlugin
+
+        source_dir = tmp_path / "editable_plugin_src"
+        module_dir = source_dir / "editable_plugin"
+        module_dir.mkdir(parents=True)
+        (module_dir / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        class FakeDistribution:
+            name = "editable-plugin"
+            # Editable installs expose only a shim, not the module source.
+            files = [Path("__editable__.editable_plugin.pth")]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+            def read_text(self, name):
+                if name == "direct_url.json":
+                    return json.dumps(
+                        {
+                            "url": source_dir.as_uri(),
+                            "dir_info": {"editable": True},
+                        }
+                    )
+                return None
+
+        load = Mock(return_value=GptmePlugin(name="editable_plugin"))
+        ep = SimpleNamespace(
+            name="editable_plugin",
+            module="editable_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_called_once_with()
+        plugin_result = next(r for r in results if r.name == "Plugin: editable_plugin")
+        assert plugin_result.status == CheckStatus.OK
+        assert "security:ok(1 files scanned)" in _details_blob(plugin_result.details)
+
+    def test_editable_install_scans_sibling_modules(self, tmp_path):
+        """Sibling modules the entry point imports must also be scanned.
+
+        An editable entry point that imports a sibling verbatim would otherwise
+        receive ``security:ok`` before doctor imports the unscanned code.
+        """
+        source_dir = tmp_path / "editable_siblings_src"
+        module_dir = source_dir / "editable_siblings"
+        module_dir.mkdir(parents=True)
+        (module_dir / "__init__.py").write_text("", encoding="utf-8")
+        # Entry point is a submodule (``pkg.cli:main``), not the package root.
+        (module_dir / "cli.py").write_text("from . import creds\n", encoding="utf-8")
+        (module_dir / "creds.py").write_text(
+            "import os\n"
+            "home = os.path.expanduser('~')\n"
+            "secret = open(f'{home}/.ssh/id_rsa').read()\n",
+            encoding="utf-8",
+        )
+
+        class FakeDistribution:
+            name = "editable-siblings"
+            files = [Path("__editable__.editable_siblings.pth")]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+            def read_text(self, name):
+                if name == "direct_url.json":
+                    return json.dumps(
+                        {
+                            "url": source_dir.as_uri(),
+                            "dir_info": {"editable": True},
+                        }
+                    )
+                return None
+
+        load = Mock(side_effect=AssertionError("unscanned plugin was imported"))
+        ep = SimpleNamespace(
+            name="editable_siblings",
+            module="editable_siblings.cli",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(
+            r for r in results if r.name == "Plugin: editable_siblings"
+        )
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "credential-harvest" in _details_blob(plugin_result.details)
+
+    def test_credential_read_through_expression_is_flagged(self, tmp_path):
+        """f-string / concatenated credential paths must not evade the scan."""
+
+        class FakeDistribution:
+            name = "expr-cred-plugin"
+            files = [Path("expr_cred_plugin/__init__.py")]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        plugin_file = tmp_path / "expr_cred_plugin" / "__init__.py"
+        plugin_file.parent.mkdir()
+        plugin_file.write_text(
+            "import os\n"
+            "home = os.path.expanduser('~')\n"
+            "secret = open(f'{home}/.ssh/id_rsa').read()\n",
+            encoding="utf-8",
+        )
+        load = Mock(side_effect=AssertionError("malicious plugin was imported"))
+        ep = SimpleNamespace(
+            name="expr_cred_plugin",
+            module="expr_cred_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: expr_cred_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "credential-harvest" in _details_blob(plugin_result.details)
+
+    def test_package_enumeration_error_is_a_plugin_verdict(self):
+        """A package whose __path__ cannot be enumerated must not abort doctor."""
+        from gptme.plugins.plugin import GptmePlugin
+
+        plugin = GptmePlugin(name="enum_boom_plugin", tool_modules=["gptme.tools"])
+        ep = SimpleNamespace(name="enum_boom_plugin", load=lambda: plugin)
+        with (
+            patch("importlib.metadata.entry_points", return_value=[ep]),
+            patch(
+                "pkgutil.iter_modules",
+                side_effect=OSError("cannot enumerate package"),
+            ),
+        ):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: enum_boom_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        blob = _details_blob(plugin_result.details)
+        assert "enumerate OSError: cannot enumerate package" in blob
+
+    def test_disabled_entry_point_is_not_loaded(self):
+        """plugins.enabled must skip disabled entry points without importing them."""
+        load = Mock(side_effect=AssertionError("disabled plugin imported"))
+        ep = SimpleNamespace(
+            name="disabled_plugin",
+            module="disabled_plugin",
+            load=load,
+        )
+        config = SimpleNamespace(get_plugin_config=lambda: ([], ["only-this-plugin"]))
+        with (
+            patch("importlib.metadata.entry_points", return_value=[ep]),
+            patch("gptme.cli.doctor.get_config", return_value=config),
+        ):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: disabled_plugin")
+        assert plugin_result.status == CheckStatus.SKIPPED
+        assert "plugins.enabled" in plugin_result.message
+
+    def test_non_toolspec_entry_is_a_plugin_verdict(self):
+        """A malformed tools list must not abort the doctor run."""
+        from gptme.plugins.plugin import GptmePlugin
+        from gptme.tools.base import ToolSpec
+
+        plugin = GptmePlugin(
+            name="malformed_plugin",
+            tools=[None, ToolSpec(name="ok_tool", desc="ok")],  # type: ignore[list-item]
+        )
+        ep = SimpleNamespace(name="malformed_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: malformed_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        blob = _details_blob(plugin_result.details)
+        assert "NoneType:error(not a ToolSpec)" in blob
+        assert "ok_tool:ok(no-init)" in blob
+
+    def test_plugin_init_runs_before_tool_init(self):
+        """Doctor must call GptmePlugin.init(config) before tool initializers."""
+        from gptme.plugins.plugin import GptmePlugin
+        from gptme.tools.base import ToolSpec
+
+        order: list[str] = []
+
+        def plugin_init(_config):
+            order.append("plugin")
+
+        def tool_init():
+            order.append("tool")
+            return ToolSpec(name="ordered_tool", desc="ok")
+
+        plugin = GptmePlugin(
+            name="ordered_plugin",
+            init=plugin_init,
+            tools=[ToolSpec(name="ordered_tool", desc="ok", init=tool_init)],
+        )
+        ep = SimpleNamespace(name="ordered_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        assert order == ["plugin", "tool"]
+        plugin_result = next(r for r in results if r.name == "Plugin: ordered_plugin")
+        assert plugin_result.status == CheckStatus.OK
+        blob = _details_blob(plugin_result.details)
+        assert "init:ok" in blob
+        assert "ordered_tool:ok" in blob
+
+    def test_plugin_init_failure_is_attributed(self):
+        """A failing plugin initializer is a plugin verdict, not a doctor crash."""
+        from gptme.plugins.plugin import GptmePlugin
+        from gptme.tools.base import ToolSpec
+
+        def plugin_init(_config):
+            raise RuntimeError("init boom")
+
+        plugin = GptmePlugin(
+            name="init_boom_plugin",
+            init=plugin_init,
+            tools=[ToolSpec(name="still_checked", desc="ok")],
+        )
+        ep = SimpleNamespace(name="init_boom_plugin", load=lambda: plugin)
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        plugin_result = next(r for r in results if r.name == "Plugin: init_boom_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        blob = _details_blob(plugin_result.details)
+        assert "init:error(RuntimeError: init boom)" in blob
+        assert "still_checked:ok(no-init)" in blob
+
+    def test_importable_tests_payload_is_scanned(self, tmp_path):
+        """Files under package/tests/ are importable and must not be skipped."""
+        pkg = tmp_path / "payload_plugin"
+        tests_dir = pkg / "tests"
+        tests_dir.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(
+            "from .tests import payload\n", encoding="utf-8"
+        )
+        (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+        (tests_dir / "payload.py").write_text(
+            "secret = open('~/.ssh/id_rsa').read()\n",
+            encoding="utf-8",
+        )
+
+        class FakeDistribution:
+            name = "payload-plugin"
+            files = [
+                Path("payload_plugin/__init__.py"),
+                Path("payload_plugin/tests/__init__.py"),
+                Path("payload_plugin/tests/payload.py"),
+            ]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        load = Mock(side_effect=AssertionError("payload plugin was imported"))
+        ep = SimpleNamespace(
+            name="payload_plugin",
+            module="payload_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: payload_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "credential-harvest" in _details_blob(plugin_result.details)
+
+    def test_multiline_credential_read_is_flagged(self, tmp_path):
+        """A split open() call must not evade the line-oriented scan."""
+
+        class FakeDistribution:
+            name = "multiline-cred-plugin"
+            files = [Path("multiline_cred_plugin/__init__.py")]
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        plugin_file = tmp_path / "multiline_cred_plugin" / "__init__.py"
+        plugin_file.parent.mkdir()
+        plugin_file.write_text(
+            "secret = open(\n    '~/.ssh/id_rsa'\n).read()\n",
+            encoding="utf-8",
+        )
+        load = Mock(side_effect=AssertionError("malicious plugin was imported"))
+        ep = SimpleNamespace(
+            name="multiline_cred_plugin",
+            module="multiline_cred_plugin",
+            dist=FakeDistribution(),
+            load=load,
+        )
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(
+            r for r in results if r.name == "Plugin: multiline_cred_plugin"
+        )
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "credential-harvest" in _details_blob(plugin_result.details)
+
+    def test_missing_distribution_is_unverified_not_imported(self):
+        """An entry point with no dist metadata must fail closed, not import."""
+        load = Mock(side_effect=AssertionError("unscanned plugin imported"))
+        ep = SimpleNamespace(
+            name="no_dist_plugin",
+            module="no_dist_plugin",
+            dist=None,
+            load=load,
+        )
+        with patch("importlib.metadata.entry_points", return_value=[ep]):
+            results = _check_plugins()
+
+        load.assert_not_called()
+        plugin_result = next(r for r in results if r.name == "Plugin: no_dist_plugin")
+        assert plugin_result.status == CheckStatus.ERROR
+        assert "could not verify entry point" in plugin_result.message

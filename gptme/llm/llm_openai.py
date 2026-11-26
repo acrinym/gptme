@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import Generator, Iterable
 from functools import lru_cache, wraps
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import requests
 
@@ -15,6 +15,7 @@ from ..config import Config, get_config
 from ..constants import OPENAI_VERBOSITY, TEMPERATURE, TOP_P
 from ..message import Message, MessageMetadata, UsageData, msgs2dicts
 from ..telemetry import _calculate_llm_cost, record_llm_request
+from ..tools.base import truncate_tool_description
 from .constants import _MIN_RESPONSE_TOKENS, OPENROUTER_APP_HEADERS
 from .models import (
     CustomProvider,
@@ -35,6 +36,7 @@ from .openai_responses import (
     _obj_get,
     _stream_responses_events,
     _tool_spec_to_responses_tool,
+    served_model_from,
 )
 from .retry_abort import backoff_wait, current_generation
 from .retry_policy import (
@@ -221,23 +223,49 @@ def _make_resolved_model(model: str, openrouter_provider: str) -> str | None:
     return resolved
 
 
+def _openrouter_provider_from(obj: Any) -> str | None:
+    """Return the serving provider OpenRouter reports in a response body.
+
+    OpenRouter includes a top-level ``provider`` field (e.g. ``"Together"``) in
+    chat completion responses and in every streaming chunk. The
+    ``x-openrouter-provider`` response header carries the same information, but
+    OpenAI-compatible proxies in front of OpenRouter often forward only the body,
+    so this is the fallback when the header is absent. The OpenAI SDK keeps
+    unknown response fields in ``model_extra``.
+    """
+    extra = getattr(obj, "model_extra", None)
+    value = extra.get("provider") if isinstance(extra, dict) else None
+    if value is None:
+        value = getattr(obj, "provider", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 def _record_usage(
     usage,
     model: str,
     resolved_model: str | None = None,
     reasoning_effort: str | None = None,
+    served_model: str | None = None,
 ) -> MessageMetadata | None:
     """Record usage metrics as telemetry and return MessageMetadata.
 
     ``reasoning_effort`` is the effective level applied to the request (from
     ``GPTME_THINKING_EFFORT``); it is stamped on the metadata so session logs
     record how much reasoning was requested, not just how many tokens came back.
+
+    ``served_model`` is the model id exactly as the provider reported it in its
+    response (``response.model`` / ``chunk.model``); stamped whenever non-empty,
+    even when it equals the requested model.
     """
     if not usage:
-        if resolved_model or reasoning_effort:
+        if resolved_model or reasoning_effort or served_model:
             bare: MessageMetadata = {"model": model}
             if resolved_model:
                 bare["resolved_model"] = resolved_model
+            if served_model:
+                bare["served_model"] = served_model
             if reasoning_effort:
                 bare["reasoning_effort"] = reasoning_effort
             return bare
@@ -305,6 +333,8 @@ def _record_usage(
     metadata: MessageMetadata = {"model": model}
     if resolved_model:
         metadata["resolved_model"] = resolved_model
+    if served_model:
+        metadata["served_model"] = served_model
     if reasoning_effort:
         metadata["reasoning_effort"] = reasoning_effort
     if usage_data:
@@ -675,11 +705,20 @@ def init(provider: Provider, config: Config):
 
             plugin = get_provider_plugin(str(provider))
             if plugin:
-                api_key = config.get_env(plugin.api_key_env) or ""
-                if not api_key:
-                    raise KeyError(
-                        f"Missing environment variable {plugin.api_key_env} "
-                        f"required by provider plugin {plugin.name!r}"
+                if plugin.api_key_env:
+                    api_key = config.get_env(plugin.api_key_env) or ""
+                    if not api_key:
+                        raise KeyError(
+                            f"Missing environment variable {plugin.api_key_env} "
+                            f"required by provider plugin {plugin.name!r}"
+                        )
+                else:
+                    # Provider uses no API key (e.g. per-request payment)
+                    api_key = "no-key"
+                if not plugin.base_url:
+                    raise ValueError(
+                        f"Provider plugin {plugin.name!r} has no base_url; "
+                        "requests would silently go to the default OpenAI endpoint"
                     )
                 _init_openai_client(
                     provider,
@@ -1133,7 +1172,10 @@ def chat(
 
         response = client.responses.create(**response_kwargs)
         metadata = _record_usage(
-            response.usage, model, reasoning_effort=reasoning_effort
+            response.usage,
+            model,
+            reasoning_effort=reasoning_effort,
+            served_model=served_model_from(response),
         )
 
         result: list[str] = []
@@ -1217,6 +1259,7 @@ def chat(
     response = raw_response.parse()
     _or_provider = (
         raw_response.headers.get("x-openrouter-provider")
+        or _openrouter_provider_from(response)
         if _uses_openrouter_backend(provider, model_meta)
         else None
     )
@@ -1226,6 +1269,7 @@ def chat(
         model,
         resolved_model=_resolved,
         reasoning_effort=reasoning_effort,
+        served_model=served_model_from(response),
     )
     if not response.choices:
         raise ValueError("OpenAI API returned empty choices list")
@@ -1272,7 +1316,22 @@ def extra_headers(provider: Provider) -> dict[str, str]:
 
 ENV_THINKING_EFFORT = "GPTME_THINKING_EFFORT"
 _OPENROUTER_REASONING_DEFAULT = 20000
-_VALID_QUANTIZATIONS = {"fp16", "bf16", "fp8", "int8", "int4", "unknown"}
+# Matches the values OpenRouter's provider routing accepts.
+# See: https://openrouter.ai/docs/features/provider-routing#quantization
+_VALID_QUANTIZATIONS = {
+    "int4",
+    "int8",
+    "fp4",
+    "mxfp4",
+    "nvfp4",
+    "fp6",
+    "fp8",
+    "mxfp8",
+    "fp16",
+    "bf16",
+    "fp32",
+    "unknown",
+}
 _KIMI_K3_REASONING_EFFORTS = {"low", "high", "max"}
 # OpenAI ``reasoning_effort`` (Chat Completions) / ``reasoning.effort``
 # (Responses API). Mirrors the openai SDK's ``ReasoningEffort`` literal; which
@@ -1289,7 +1348,15 @@ _OPENAI_REASONING_EFFORTS = {
 }
 # OpenRouter unified ``reasoning.effort`` levels, translated per upstream.
 # See: https://openrouter.ai/docs/use-cases/reasoning-tokens
-_OPENROUTER_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+_OPENROUTER_REASONING_EFFORTS = {
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+}
 
 
 def _resolve_reasoning_effort(provider: Provider, model_meta: ModelMeta) -> str | None:
@@ -1531,22 +1598,91 @@ def _stream_responses(
             kwargs["top_p"] = top_p_value
 
     captured_metadata: MessageMetadata | None = None
+    served_model: str | None = None
+
+    def _capture_model(served: str) -> None:
+        # Last non-empty wins; fires before usage on response.completed.
+        nonlocal served_model
+        served_model = served
 
     def _capture_usage(usage: Any) -> None:
         nonlocal captured_metadata
         captured_metadata = _record_usage(
-            usage, model, reasoning_effort=reasoning_effort
+            usage,
+            model,
+            reasoning_effort=reasoning_effort,
+            served_model=served_model,
         )
 
     stream = client.responses.create(**kwargs)
-    yield from _stream_responses_events(stream, usage_callback=_capture_usage)
+    yield from _stream_responses_events(
+        _guarded_stream_iter(stream, model=model, provider=provider),
+        usage_callback=_capture_usage,
+        model_callback=_capture_model,
+    )
 
-    if captured_metadata is None and reasoning_effort is not None:
-        # No usage event arrived; still record what was requested.
+    if captured_metadata is None and (
+        reasoning_effort is not None or served_model is not None
+    ):
+        # No usage event arrived; still record what was requested/served.
         captured_metadata = _record_usage(
-            None, model, reasoning_effort=reasoning_effort
+            None,
+            model,
+            reasoning_effort=reasoning_effort,
+            served_model=served_model,
         )
     return captured_metadata
+
+
+def _reraise_openai_stream_iteration_error(
+    exc: BaseException, *, model: str, provider: Provider
+) -> NoReturn:
+    """Re-raise a chat-stream iterator crash so retry and recovery can see it.
+
+    The openai SDK raises ``IndexError`` (and similar) inside ``Stream.__next__``
+    when a provider sends a malformed SSE chunk. That is not an
+    ``openai.APIError``, so wrapping it as ``ValueError`` would skip
+    ``_handle_openai_transient_error`` and ``is_provider_error()`` — the
+    session still dies opaque. Preserve real SDK and httpx errors; convert
+    the rest to ``httpx.RemoteProtocolError``.
+    """
+    from openai import OpenAIError  # fmt: skip
+
+    httpx = importlib.import_module("httpx")
+    if isinstance(exc, OpenAIError | httpx.HTTPError):
+        raise exc
+    raise httpx.RemoteProtocolError(
+        f"OpenAI stream iteration failed while parsing a chunk from "
+        f"{model} (provider={provider}): {exc!r}"
+    ) from exc
+
+
+def _guarded_stream_iter(
+    source: Iterable[Any], *, model: str, provider: Provider
+) -> Generator[Any, None, None]:
+    """Advance a provider SDK stream, converting parser crashes on ``next()``.
+
+    Only the advance is guarded, never the consumer body, so genuine bugs in
+    gptme's own processing stay visible. Shared by the Chat Completions and
+    Responses API streams so a malformed SSE event is retryable and classifiable
+    on both paths.
+
+    ``iter(source)`` is unguarded on purpose: ``openai.Stream.__iter__`` only
+    constructs a generator. Chunk parsing runs in ``Stream.__next__`` /
+    ``__stream__``, which is the ``next(iterator)`` call below.
+    """
+    # Parsing crashes on next(), not on constructing the iterator.
+    iterator = iter(source)
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        except Exception as exc:
+            _reraise_openai_stream_iteration_error(exc, model=model, provider=provider)
+        # Yield is outside the try: a consumer .throw() / yield-from throw-in
+        # at this point must stay the original exception, not a protocol error.
+        yield item
 
 
 @retry_generator_on_openai_error()
@@ -1651,6 +1787,9 @@ def stream(
     # stream. The x-openrouter-provider header is available on the initial
     # HTTP response (before the stream body starts).
     _or_resolved: str | None = None
+    # Set when the header is missing (e.g. behind an OpenAI-compatible proxy):
+    # fall back to the ``provider`` field OpenRouter puts in each chunk body.
+    _or_provider_from_body = False
     if _uses_openrouter_backend(provider, model_meta):
         try:
             _or_stream_provider = _stream_obj.response.headers.get(
@@ -1658,6 +1797,7 @@ def stream(
             )
         except AttributeError:
             _or_stream_provider = None
+        _or_provider_from_body = not _or_stream_provider
         if _or_stream_provider:
             _or_resolved = _make_resolved_model(model, _or_stream_provider)
             captured_metadata = _record_usage(
@@ -1667,15 +1807,37 @@ def stream(
                 reasoning_effort=reasoning_effort,
             )
 
-    for chunk_raw in _stream_obj:
+    # Model id as the provider reports it on each chunk (last non-empty wins).
+    served_model: str | None = None
+
+    for chunk_raw in _guarded_stream_iter(_stream_obj, model=model, provider=provider):
         from openai.types.chat import ChatCompletionChunk  # fmt: skip
         from openai.types.chat.chat_completion_chunk import (  # fmt: skip
             ChoiceDeltaToolCall,
             ChoiceDeltaToolCallFunction,
         )
 
+        if _or_provider_from_body and (
+            _body_provider := _openrouter_provider_from(chunk_raw)
+        ):
+            _or_provider_from_body = False
+            _or_resolved = _make_resolved_model(model, _body_provider)
+            if _or_resolved:
+                if captured_metadata is None:
+                    captured_metadata = _record_usage(
+                        None,
+                        model,
+                        resolved_model=_or_resolved,
+                        reasoning_effort=reasoning_effort,
+                    )
+                else:
+                    captured_metadata["resolved_model"] = _or_resolved
+
         # Cast the chunk to the correct type
         chunk = cast(ChatCompletionChunk, chunk_raw)
+
+        if chunk_served := served_model_from(chunk):
+            served_model = chunk_served
 
         # Record usage if available (typically in final chunk)
         # and capture metadata for message attachment
@@ -1685,6 +1847,7 @@ def stream(
                 model,
                 resolved_model=_or_resolved,
                 reasoning_effort=reasoning_effort,
+                served_model=served_model,
             )
 
         if not chunk.choices:
@@ -1736,11 +1899,20 @@ def stream(
 
     logger.debug(f"Stop reason: {stop_reason}")
 
-    if captured_metadata is None and reasoning_effort is not None:
-        # No usage chunk arrived; still record what was requested.
+    if captured_metadata is None and (
+        reasoning_effort is not None or served_model is not None
+    ):
+        # No usage chunk arrived; still record what was requested/served.
         captured_metadata = _record_usage(
-            None, model, reasoning_effort=reasoning_effort
+            None,
+            model,
+            reasoning_effort=reasoning_effort,
+            served_model=served_model,
         )
+    elif captured_metadata is not None and served_model is not None:
+        # Covers the OpenRouter header-only metadata built before the stream
+        # and a usage chunk that arrived before the last model-bearing chunk.
+        captured_metadata["served_model"] = served_model
     # Return the captured metadata (accessible via StopIteration.value)
     return captured_metadata
 
@@ -2231,13 +2403,7 @@ def _spec2tool(spec: ToolSpec, model: ModelMeta) -> ChatCompletionToolParam:
         or spec.desc
         or ""
     )
-    if len(description) > 1024:
-        logger.warning(
-            "Description for tool `%s` is too long ( %d > 1024 chars). Truncating...",
-            spec.name,
-            len(description),
-        )
-        description = description[:1024]
+    description = truncate_tool_description(description, spec.name)
 
     # Custom providers are OpenAI-compatible and support tools API.
     # grok-subscription routes to xAI's OpenAI-compatible subscription proxy

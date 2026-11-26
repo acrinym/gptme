@@ -27,6 +27,7 @@ import gptme
 
 from ..constants import MULTIPROMPT_SEPARATOR
 from ..dirs import get_logs_dir
+from ..util.multiprompt import group_prompt_args as _group_prompt_args
 
 # NOTE: keep module-level imports of the wider gptme package out of this file.
 # Importing gptme.cli.main should stay cheap: `gptme --help`, `--version`, and
@@ -469,23 +470,6 @@ def _find_missing_explicit_local_path(prompts: list[str]) -> str | None:
     return None
 
 
-def _group_prompt_args(prompts: list[str] | tuple[str, ...]) -> list[str]:
-    """Group CLI prompt arguments on exact standalone separator arguments."""
-    if len(prompts) == 1:
-        return [prompts[0].strip()] if prompts[0].strip() else []
-
-    grouped: list[str] = []
-    current: list[str] = []
-    for prompt in prompts:
-        if prompt == MULTIPROMPT_SEPARATOR:
-            grouped.append("\n\n".join(current))
-            current = []
-        else:
-            current.append(prompt)
-    grouped.append("\n\n".join(current))
-    return [stripped for group in grouped if (stripped := group.strip())]
-
-
 def _known_tool_names() -> list[str]:
     """Names of all known built-in tools (available or not).
 
@@ -725,6 +709,12 @@ Run 'gptme-util --help' for all utility commands."""
     help="Enable profiling and save results to gptme-profile-{timestamp}.prof",
 )
 @click.option(
+    "--context-budget",
+    type=float,
+    default=None,
+    help="Compaction threshold as a window fraction (0<x≤1) or absolute tokens (>1).",
+)
+@click.option(
     "--context",
     "context_include",
     multiple=True,
@@ -752,6 +742,13 @@ Run 'gptme-util --help' for all utility commands."""
     hidden=True,
     help="Schema for structured output in format 'module:ClassName'. The class should be a Pydantic BaseModel.",
 )
+@click.option(
+    "--allow-hosts",
+    "allow_hosts",
+    default=None,
+    envvar="GPTME_ALLOW_HOSTS",
+    help="Comma-separated hostnames the agent may access via web tools (e.g. 'github.com,*.googleapis.com'). Default: unrestricted. Wildcard subdomains supported.",
+)
 def main(
     ctx: click.Context,
     prompts: list[str],
@@ -775,9 +772,11 @@ def main(
     workspace: str | None,
     agent_path: str | None,
     profile: bool,
+    context_budget: float | None,
     context_include: tuple[str, ...],
     no_workspace: bool,
     output_schema: str | None,
+    allow_hosts: str | None,
 ):
     """Main entrypoint for the CLI."""
     show_version = version or version_json
@@ -866,6 +865,12 @@ def main(
             "--no-workspace and --context are mutually exclusive: "
             "--no-workspace strips all workspace context, so --context values would be silently ignored."
         )
+
+    # Click's auto_envvar_prefix also maps GPTME_CONTEXT_BUDGET onto this option.
+    # Keep that value in the environment layer rather than persisting it as a
+    # one-chat CLI override.
+    if ctx.get_parameter_source("context_budget") != ParameterSource.COMMANDLINE:
+        context_budget = None
 
     # Apply agent profile if specified
     selected_profile = None
@@ -1162,6 +1167,7 @@ def main(
                     stream=stream,
                     interactive=interactive,
                     agent_path=Path(agent_path) if agent_path else None,
+                    context_budget=context_budget,
                 )
             except ValueError as e:
                 raise click.UsageError(str(e)) from e
@@ -1284,6 +1290,21 @@ def main(
     else:
         workspace_path = Path(workspace) if workspace else Path.cwd()
 
+    # Imported lazily: a module-level import of gptme.tools initializes the
+    # whole tools package even for --help/--version/external dispatch, which
+    # is startup-benchmarked.
+    from ..tools._url_safety import parse_allow_hosts
+
+    # Parse allow_hosts: comma-separated string → list[str] or None.
+    # Empty string is a deliberate empty allowlist (block all hosts), not
+    # "unrestricted" -- parse_allow_hosts preserves that distinction.
+    # Invalid entries (e.g. a bare '*') surface as a click usage error,
+    # not a traceback.
+    try:
+        allow_hosts_list = parse_allow_hosts(allow_hosts)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
+
     # Setup complete configuration from CLI arguments and workspace
     try:
         config = setup_config_from_cli(
@@ -1297,6 +1318,8 @@ def main(
             stream=stream,
             interactive=interactive,
             agent_path=Path(agent_path) if agent_path else None,
+            allow_hosts=allow_hosts_list,
+            context_budget=context_budget,
         )
     except ValueError as e:
         raise click.UsageError(str(e)) from e
@@ -1499,6 +1522,12 @@ def main(
             _write_terminal_error_to_log(logdir, error_class, exit_code, str(e))
         else:
             exit_code = 1
+        # the conversation is saved; say how to get back to it once the
+        # cause is fixed (printed at exit if the log is nonempty).
+        # A live lock is the exception: resume is the same failing command
+        # (gptme#2607).
+        if not _is_conversation_lock_error(e):
+            show_resume_hint_on_exit = True
         sys.exit(exit_code)
     finally:
         if signal.getsignal(signal.SIGTERM) is handle_sigterm:
@@ -1654,6 +1683,15 @@ def _cleanup_aborted_new_logdir(logdir: Path, *, preexisting: bool) -> None:
 EXIT_RATE_LIMIT = 75  # EX_TEMPFAIL — quota exhausted, retry later
 EXIT_AUTH_ERROR = 76  # EX_PROTOCOL — credential / permission problem
 EXIT_MODEL_UNAVAIL = 77  # EX_NOPERM   — model/service not reachable
+
+
+def _is_conversation_lock_error(e: BaseException) -> bool:
+    """True when another gptme instance holds the conversation lock.
+
+    Resume would retry the same locked chat, so the goodbye hint is bogus.
+    """
+    msg = str(e).lower()
+    return "another gptme instance" in msg and "is using" in msg
 
 
 def _classify_fatal_error(e: BaseException) -> tuple[str, int]:

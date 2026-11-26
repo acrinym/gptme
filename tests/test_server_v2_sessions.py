@@ -1942,6 +1942,77 @@ class TestConcurrentToolConfirmation:
         assert step_calls == [True]
         assert session._executing_tools == set()
 
+    def test_post_tool_compaction_holds_conversation_lock(
+        self, conv, client: FlaskClient
+    ):
+        """Post-tool compaction must serialize on conversation_lock."""
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        tool_id = str(uuid.uuid4())
+        tool_exec = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("bash", [], "echo done"),
+            auto_confirm=False,
+        )
+        tool_exec.tooluse = MagicMock(
+            tool="bash", args=[], content="echo done", call_id=tool_id
+        )
+        tool_exec.tooluse.execute = lambda *args, **kwargs: []
+        session.pending_tools[tool_id] = tool_exec
+
+        held_during_compact: list[bool] = []
+
+        def capturing_compact(manager, session_obj, conversation_id, **kwargs):
+            lock = SessionManager.conversation_lock(conversation_id)
+            contended = threading.Event()
+
+            def probe() -> None:
+                got = lock.acquire(blocking=False)
+                if got:
+                    lock.release()
+                else:
+                    contended.set()
+
+            probe_thread = threading.Thread(target=probe)
+            probe_thread.start()
+            probe_thread.join(timeout=5)
+            held_during_compact.append(contended.is_set())
+
+        chat_config = ChatConfig(model="mock/model")
+        with (
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch(
+                "gptme.server.session_step.LogManager.load",
+                return_value=MagicMock(
+                    log=MagicMock(messages=[]), workspace=MagicMock()
+                ),
+            ),
+            patch("gptme.server.session_step._append_and_notify"),
+            patch("gptme.server.session_step._attach_tool_timings"),
+            patch("gptme.server.session_step._start_step_thread"),
+            patch(
+                "gptme.server.session_step._compact_after_tool_results",
+                side_effect=capturing_compact,
+            ),
+        ):
+            thread = start_tool_execution(
+                conv["conversation_id"],
+                session,
+                tool_id,
+                None,
+                "mock/model",
+                chat_config,
+                branch="main",
+            )
+            thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert held_during_compact == [True]
+
     def test_claim_released_when_setup_raises_before_execution(
         self, conv, client: FlaskClient
     ):
@@ -2329,12 +2400,26 @@ class TestElicitRespondEndpoint:
 class TestEventsEndpoint:
     """Test GET /api/v2/conversations/<id>/events validation."""
 
-    def test_invalid_session_id_returns_404(self, conv, client: FlaskClient):
-        """Events with nonexistent session_id returns 404."""
+    def test_stale_session_id_creates_new_session(self, conv, client: FlaskClient):
+        """A stale session_id (e.g. after a server restart) gets a fresh session.
+
+        Returning 404 here made every client reconnect fail until it gave up,
+        since sessions are in-memory and a restart invalidates all of them.
+        """
+        from gptme.server.api_v2_sessions import SessionManager
+
         response = client.get(
-            f"/api/v2/conversations/{conv['conversation_id']}/events?session_id=nonexistent"
+            f"/api/v2/conversations/{conv['conversation_id']}/events?session_id=nonexistent",
+            buffered=False,
         )
-        assert response.status_code == 404
+        assert response.status_code == 200
+        assert response.content_type.startswith("text/event-stream")
+        first = next(response.iter_encoded())
+        response.close()
+        event = json.loads(first.decode().removeprefix("data: ").strip())
+        assert event["type"] == "connected"
+        assert event["session_id"] != "nonexistent"
+        assert SessionManager.get_session(event["session_id"]) is not None
 
     def test_no_session_id_creates_session(self, conv, client: FlaskClient):
         """Events without session_id creates a new session and streams."""
@@ -2481,3 +2566,37 @@ class TestTranscriptEndpointInputValidation:
         data = response.get_json()
         assert data is not None
         assert "call_sid" in data["error"]
+
+
+class TestSafeSessionIdForLog:
+    """Client-controlled session_id must be log-safe before hitting the logger."""
+
+    def test_truncates_oversized_id(self):
+        from gptme.server.api_v2_sessions import _safe_session_id_for_log
+
+        result = _safe_session_id_for_log("x" * 500)
+        assert len(result) == 80
+        assert result == "x" * 80
+
+    def test_strips_newlines_and_control_bytes(self):
+        from gptme.server.api_v2_sessions import _safe_session_id_for_log
+
+        result = _safe_session_id_for_log("abc\ndef\r\x00\x1bghi")
+        assert "\n" not in result and "\r" not in result
+        assert result == "abc?def???ghi"
+
+    def test_newline_within_first_80_chars_is_neutralized(self):
+        # Regression: a previous slice truncated to 80 chars but left the
+        # newline intact, so forged multi-line log output was still possible.
+        from gptme.server.api_v2_sessions import _safe_session_id_for_log
+
+        payload = "a" * 40 + "\nFAKE ERROR: total pwnage\n" + "b" * 100
+        result = _safe_session_id_for_log(payload)
+        assert "\n" not in result
+        assert len(result) == 80
+
+    def test_keeps_valid_uuid_untouched(self):
+        from gptme.server.api_v2_sessions import _safe_session_id_for_log
+
+        sid = str(uuid.uuid4())
+        assert _safe_session_id_for_log(sid) == sid

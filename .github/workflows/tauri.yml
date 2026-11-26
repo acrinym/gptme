@@ -19,10 +19,42 @@ on:
         description: 'Release tag to build for (e.g., v0.31.1.dev20260310)'
         required: false
 
+# Cancel a PR's older runs when it gets a new push (they're superseded).
+# Every other run (master push, release dispatch) gets its own group, so none
+# of them can cancel or replace another (same as the other workflows, #4000).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # On PRs that only change the web UI (not tauri/), skip the macOS, Windows
+  # and Android builds: they rarely break from web UI changes and are the
+  # slowest/scarcest runners. Lint, tests, E2E and the Linux build still run;
+  # master pushes and manual runs build everything.
+  changes:
+    name: Detect changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      pull-requests: read
+    outputs:
+      tauri: ${{ steps.filter.outputs.tauri }}
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dorny/paths-filter@v4
+      id: filter
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        filters: |
+          tauri:
+            - 'tauri/**'
+            - '.github/workflows/tauri.yml'
+
   lint:
     name: Lint (format + clippy)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v7
@@ -75,6 +107,7 @@ jobs:
   test:
     name: Test (unit + IPC)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v7
@@ -120,6 +153,7 @@ jobs:
   e2e:
     name: E2E tests (tauri-driver, Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: [lint, test]
     env:
       TAURI_DRIVER_VERSION: 2.0.6
@@ -220,18 +254,16 @@ jobs:
 
   build:
     name: Build (${{ matrix.platform }})
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.result != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: macos-latest
-            args: '--bundles app'
-          - platform: ubuntu-24.04
-            args: '--bundles appimage,deb'
-          - platform: windows-latest
-            args: '--bundles nsis'
+        # all platforms, or only Linux on web-UI-only PRs (see `changes`)
+        include: ${{ fromJson((github.event_name != 'pull_request' || needs.changes.outputs.tauri == 'true') && '[{"platform":"macos-latest","args":"--bundles app"},{"platform":"ubuntu-24.04","args":"--bundles appimage,deb"},{"platform":"windows-latest","args":"--bundles nsis"}]' || '[{"platform":"ubuntu-24.04","args":"--bundles appimage,deb"}]') }}
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v7
@@ -334,6 +366,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v7
@@ -419,6 +452,7 @@ jobs:
             args: '--bundles nsis'
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
     permissions:
       contents: write
 
@@ -694,8 +728,14 @@ jobs:
   build-android:
     name: Build Android (APK/AAB)
     # Only aarch64 for PR/push checks; full multi-arch on release tags
-    needs: [lint, test]
+    needs: [changes, lint, test]
+    # skipped on web-UI-only PRs (see `changes`)
+    if: >-
+      ${{ !cancelled()
+          && needs.lint.result == 'success' && needs.test.result == 'success'
+          && (github.event_name != 'pull_request' || needs.changes.outputs.tauri == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v7
@@ -710,8 +750,20 @@ jobs:
 
       - name: Install Android NDK 27
         run: |
-          ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973"
-          echo "NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> $GITHUB_ENV
+          NDK_VERSION="27.0.12077973"
+          for attempt in 1 2 3; do
+            if "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}"; then
+              break
+            fi
+            rm -rf "${ANDROID_HOME}/ndk/${NDK_VERSION}"
+            if [[ "${attempt}" == 3 ]]; then
+              echo "sdkmanager attempt ${attempt} failed (likely a corrupted download); no retries remain." >&2
+              exit 1
+            fi
+            echo "sdkmanager attempt ${attempt} failed (likely a corrupted download); retrying..." >&2
+            sleep 10
+          done
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> $GITHUB_ENV
 
       - name: Set up Rust with Android targets
         uses: dtolnay/rust-toolchain@stable
@@ -779,6 +831,7 @@ jobs:
       (startsWith(github.ref, 'refs/tags/v') || inputs.tag != '')
     needs: [lint, test, build, build-android]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: tauri-autoupdater-signing
     env:
       # True only when the Android signing key, credentials, and pinned

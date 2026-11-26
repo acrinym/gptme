@@ -2,6 +2,7 @@
 Constants
 """
 
+import functools
 import os
 
 # Optimized for code
@@ -25,9 +26,81 @@ MULTIPROMPT_SEPARATOR = "-"
 # Prompts
 ROLE_COLOR = {
     "user": "green",
-    "assistant": os.environ.get("GPTME_AGENT_COLOR", "green"),
+    "assistant": "green",  # GPTME_AGENT_COLOR: see configured_role_color
     "system": "grey42",
 }
+
+
+def valid_color(value: object, where: str) -> str | None:
+    """Return *value* if it is a color Rich can parse, else warn and drop it.
+
+    Accepts hex (``#e5a50a``), ``rgb(r,g,b)`` and color names. An invalid
+    color (or a non-string, e.g. ``color = 123`` in TOML) must not stop gptme
+    from starting or break rendering.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        from rich.color import Color, ColorParseError
+
+        try:
+            Color.parse(value)
+            return value
+        except (ColorParseError, ValueError, KeyError):
+            pass
+    import logging
+
+    logging.getLogger(__name__).warning("Ignoring invalid %s color %r", where, value)
+    return None
+
+
+def color_to_hex(value: object) -> str | None:
+    """Convert a validated Rich color to a CSS-compatible hex value."""
+    if not isinstance(value, str) or not value:
+        return None
+
+    from rich.color import Color, ColorParseError
+
+    try:
+        return Color.parse(value).get_truecolor().hex
+    except (ColorParseError, ValueError, KeyError, AttributeError, TypeError):
+        return None
+
+
+@functools.lru_cache(maxsize=8)
+def _env_agent_color(value: str) -> str | None:
+    # cached: validate (and warn about) each GPTME_AGENT_COLOR value once
+    return valid_color(value, "GPTME_AGENT_COLOR")
+
+
+def env_agent_color() -> str | None:
+    """Validated ``GPTME_AGENT_COLOR``, or None if unset/invalid."""
+    env = os.environ.get("GPTME_AGENT_COLOR")
+    return _env_agent_color(env) if env else None
+
+
+def configured_role_color(role: str) -> str | None:
+    """Display color configured for a role, or None to use the default.
+
+    The agent color comes from ``GPTME_AGENT_COLOR``, then ``[agent].color``
+    in gptme.toml; the user color from ``[user].color``.
+    """
+    if role == "assistant" and (color := env_agent_color()):
+        return color
+    if role not in ("user", "assistant"):
+        return None
+    from .config import get_config
+
+    config = get_config()
+    if role == "user":
+        return config.user.user.color
+    agent = config.chat and config.chat.agent_config
+    return agent.color if agent else None
+
+
+def role_color(role: str) -> str:
+    """Display color for a message role (configured, else ``ROLE_COLOR``)."""
+    return configured_role_color(role) or ROLE_COLOR.get(role, "default")
 
 
 def prompt_user(name: str | None = None) -> str:
@@ -35,10 +108,13 @@ def prompt_user(name: str | None = None) -> str:
 
     if not name:
         name = "User"
-    return f"[bold {ROLE_COLOR['user']}]{escape(name)}[/bold {ROLE_COLOR['user']}]"
+    color = role_color("user")
+    return f"[bold {color}]{escape(name)}[/bold {color}]"
 
 
-PROMPT_USER = prompt_user()
+# default-colored; built without prompt_user() so importing this module does
+# not load the config
+PROMPT_USER = f"[bold {ROLE_COLOR['user']}]User[/bold {ROLE_COLOR['user']}]"
 
 
 def prompt_assistant(name: str | None) -> str:
@@ -46,7 +122,8 @@ def prompt_assistant(name: str | None) -> str:
 
     if not name:
         name = os.environ.get("GPTME_AGENT_NAME", "Assistant")
-    return f"[bold {ROLE_COLOR['assistant']}]{escape(name)}[/bold {ROLE_COLOR['assistant']}]"
+    color = role_color("assistant")
+    return f"[bold {color}]{escape(name)}[/bold {color}]"
 
 
 INTERRUPT_CONTENT = "Interrupted by user"

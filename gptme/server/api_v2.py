@@ -67,6 +67,7 @@ from ..config.user import (
     get_user_config_paths,
     get_user_config_runtime_info,
 )
+from ..constants import color_to_hex, env_agent_color
 from ..dirs import get_logs_dir
 from ..logmanager import (
     ConversationMeta,
@@ -853,6 +854,7 @@ def api_server_health():
 
 
 @v2_api.route("/api/v2")
+@v2_api.route("/api/v2/")
 @api_doc_simple(responses={200: ApiRootResponse}, tags=["meta"])
 def api_root():
     """V2 API root.
@@ -1594,16 +1596,23 @@ def api_conversation(conversation_id: str):
         if start > 0:
             log_dict["before"] = start  # cursor for the next older page
 
-    # Include agent info if available
+    # Include agent info if available. GPTME_AGENT_COLOR overrides the
+    # conversation agent's project color, matching TUI/CLI display.
     agent_config = chat_config.agent_config
+    assistant_color = color_to_hex(
+        env_agent_color() or (agent_config.color if agent_config else None)
+    )
     if agent_config:
         log_dict["agent"] = {
             "name": agent_config.name,
             "avatar": agent_config.avatar,
+            "color": assistant_color,
             "urls": agent_config.urls or None,
         }
         if chat_config.agent:
             log_dict["agent"]["path"] = str(chat_config.agent)
+    elif assistant_color:
+        log_dict["agent"] = {"color": assistant_color}
 
     # Surface session-level state so REST polling clients can see generation
     # status and the last step error without subscribing to SSE.
@@ -2451,6 +2460,24 @@ def api_conversation_fork(conversation_id: str):
         )
 
 
+def _leave_dir_before_delete(path: Path) -> None:
+    """Move the process out of ``path`` before it is removed.
+
+    Session steps ``os.chdir`` the whole server process into the conversation
+    workspace (``session_step.py``). Deleting that conversation used to leave
+    the process with a vanished cwd, so every later ``Path.cwd()`` — e.g. the
+    ``ChatConfig`` default workspace on ``PUT /api/v2/conversations`` — raised
+    ``FileNotFoundError`` and returned 500 until the server restarted.
+    """
+    try:
+        cwd = Path.cwd().resolve()
+    except FileNotFoundError:
+        cwd = None
+    target = path.resolve()
+    if cwd is None or cwd == target or target in cwd.parents:
+        os.chdir(get_logs_dir())
+
+
 @v2_api.route("/api/v2/conversations/<string:conversation_id>", methods=["DELETE"])
 @require_auth
 @api_doc(
@@ -2516,6 +2543,7 @@ def api_conversation_delete(conversation_id: str):
         from ..util.cost_tracker import CostTracker, session_id_for_logdir  # fmt: skip
 
         cost_session_id = session_id_for_logdir(logdir)
+        _leave_dir_before_delete(logdir)
         try:
             shutil.rmtree(logdir)
         except OSError as e:
@@ -2576,6 +2604,7 @@ def api_models():
                 "model": model.model,
                 "context": model.context,
                 "max_output": model.max_output,
+                "context_budget": model.context_budget,
                 "supports_streaming": model.supports_streaming,
                 "supports_vision": model.supports_vision,
                 "supports_reasoning": model.supports_reasoning,
@@ -3177,7 +3206,7 @@ def api_agent_avatar():
 @require_auth
 @api_doc(
     summary="Get user identity",
-    description="Get user identity info (name, avatar) from global config",
+    description="Get user identity info (name, avatar, color) from global config",
     responses={200: None},
     tags=["user"],
 )
@@ -3188,6 +3217,7 @@ def api_user():
         {
             "name": user_config.user.name,
             "avatar": user_config.user.avatar,
+            "color": color_to_hex(user_config.user.color),
         }
     )
 

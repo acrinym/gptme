@@ -85,11 +85,13 @@ mkdir -p "$BINS_DIR"
 # When uv.lock is absent (e.g. fresh checkout — it is gitignored), fall back
 # to uv pip install.  This path is NOT lock-pinned; prefer generating a uv.lock
 # (`uv lock`) or committing it for reproducible sidecar builds.
-# pyinstaller is in [tool.poetry.group.dev.dependencies]; uv maps Poetry groups
-# to --group NAME, so --group dev selects it.  server extras add Flask etc.
+# PyInstaller is exposed as the Poetry extra `pyinstaller`. uv does not map
+# [tool.poetry.group.dev.dependencies] to a PEP 735 dependency group, so
+# `--group dev` fails when no [dependency-groups].dev table exists.
+# Select only the extras this frozen server actually needs.
 cd "$REPO_ROOT"
 if [[ -f "uv.lock" ]]; then
-    if ! uv sync --frozen --extra server --group dev --quiet; then
+    if ! uv sync --frozen --extra server --extra pyinstaller --quiet; then
         echo "ERROR: uv.lock cannot satisfy pyproject.toml." \
              "Run 'uv lock' to update it, then rebuild the sidecar." >&2
         exit 1
@@ -104,8 +106,10 @@ else
     uv pip install --quiet ".[server]" pyinstaller
 fi
 # Build using the spec so hiddenimports (hooks, context providers, etc.)
-# are collected correctly. The spec already defines onefile mode and name.
-uv run pyinstaller scripts/pyinstaller/gptme-server.spec
+# are collected correctly. Tauri bundles the frontend separately through
+# frontendDist, so exclude the standalone webui-dist to avoid a redundant
+# bundle and permit building from a fresh checkout without make bundle-webui.
+GPTME_PYINSTALLER_EXCLUDE_WEBUI=1 uv run pyinstaller scripts/pyinstaller/gptme-server.spec
 
 # Rename to include target triple (Tauri sidecar convention)
 _uvlock_state=0; if [[ -f "$REPO_ROOT/uv.lock" ]]; then _uvlock_state=1; fi

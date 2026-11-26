@@ -21,6 +21,7 @@ from gptme.logmanager import (
 from gptme.logmanager.manager import (
     _active_prompt_generation,
     _merge_consecutive_messages,
+    prepare_messages,
 )
 from gptme.message import Message
 from gptme.tools import init_tools
@@ -100,6 +101,25 @@ def test_active_prompt_generation_keeps_only_newest_replacement():
     result = _active_prompt_generation([generation_one, user, generation_two])
 
     assert result == [generation_two, user]
+
+
+def test_active_prompt_generation_reorder_can_create_adjacent_same_role():
+    """A single generation between two user turns is pulled to the front
+    without dropping a message, so the users become adjacent at the same
+    length. prepare_messages must still merge — a len-change guard would skip.
+    """
+    gen = Message(
+        "system",
+        "prompt",
+        pinned=True,
+        hide=True,
+        metadata={"prompt_generation": "one"},
+    )
+    user1 = Message("user", "first")
+    user2 = Message("user", "second")
+    result = _active_prompt_generation([user1, gen, user2])
+    assert [m.role for m in result] == ["system", "user", "user"]
+    assert len(result) == 3
 
 
 def test_load_snapshots_initial_message_files(tmp_path: Path):
@@ -283,6 +303,18 @@ def test_conversation_name_error_rejects_control_and_edge_whitespace(
     value: str, expected: str
 ):
     assert conversation_name_error(value) == expected
+
+
+def test_write_sync_flushes_transcript_on_windows(tmp_path: Path, monkeypatch):
+    """Synchronous transcript writes must not fsync a read-only Windows handle."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))
+    logdir = tmp_path / "logs" / "sync-conv"
+    manager = LogManager(logdir=logdir, lock=False)
+    manager.append(Message("user", "sync this transcript"))
+
+    manager.write(sync=True)
+
+    assert (logdir / "conversation.jsonl").exists()
 
 
 def test_new_branch_persists_inherited_history(tmp_path: Path, monkeypatch):
@@ -554,6 +586,95 @@ def test_view_undo_works_on_view():
     assert len(mgr._branches["main"]) == 2  # hello + hi
 
 
+def test_active_view_survives_reload(tmp_path: Path, monkeypatch):
+    """switch_view must persist so a new LogManager.load() keeps the compacted log."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))
+    logdir = tmp_path / "logs" / "test-conv"
+    manager = LogManager(logdir=logdir)
+    manager.append(Message("user", "full history one"))
+    manager.append(Message("assistant", "full history two"))
+    manager.create_view("compacted-001", Log([Message("system", "summary")]))
+    manager.switch_view("compacted-001")
+
+    reloaded = LogManager.load(logdir, lock=False)
+    assert reloaded.current_view == "compacted-001"
+    assert [m.content for m in reloaded.log] == ["summary"]
+    assert [m.content for m in reloaded.master_log] == [
+        "full history one",
+        "full history two",
+    ]
+
+    reloaded.switch_to_master()
+    restored = LogManager.load(logdir, lock=False)
+    assert restored.current_view is None
+    assert [m.content for m in restored.log] == [
+        "full history one",
+        "full history two",
+    ]
+
+
+def test_active_view_does_not_override_non_main_branch(tmp_path: Path, monkeypatch):
+    """Loading a non-main branch must not restore the compacted main view."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))
+    logdir = tmp_path / "logs" / "test-conv-branch"
+    manager = LogManager(logdir=logdir, lock=False)
+    manager.append(Message("user", "main one"))
+    manager.append(Message("assistant", "main two"))
+    manager.branch("feature")
+    manager.append(Message("user", "feature only"))
+    manager.branch("main")
+    manager.create_view("compacted-001", Log([Message("system", "summary")]))
+    manager.switch_view("compacted-001")
+
+    reloaded = LogManager.load(logdir, branch="feature", lock=False)
+    assert reloaded.current_view is None
+    assert reloaded.current_branch == "feature"
+    assert [m.content for m in reloaded.log] == [
+        "main one",
+        "main two",
+        "feature only",
+    ]
+
+    reloaded.append(Message("assistant", "feature reply"))
+    assert [m.content for m in reloaded.log] == [
+        "main one",
+        "main two",
+        "feature only",
+        "feature reply",
+    ]
+
+    main_reloaded = LogManager.load(logdir, lock=False)
+    assert main_reloaded.current_view == "compacted-001"
+    assert [m.content for m in main_reloaded.log] == ["summary"]
+    assert [m.content for m in main_reloaded.master_log] == [
+        "main one",
+        "main two",
+    ]
+
+
+def test_non_main_view_does_not_replace_persisted_main_view(
+    tmp_path: Path, monkeypatch
+):
+    """A feature-branch view must not become the active main-branch view."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))
+    logdir = tmp_path / "logs" / "test-conv-branch-marker"
+    manager = LogManager(logdir=logdir, lock=False)
+    manager.append(Message("user", "main history"))
+    manager.branch("feature")
+    manager.append(Message("user", "feature history"))
+    manager.branch("main")
+    manager.create_view("main-view", Log([Message("system", "main summary")]))
+    manager.switch_view("main-view")
+
+    feature = LogManager.load(logdir, branch="feature", lock=False)
+    feature.create_view("feature-view", Log([Message("system", "feature summary")]))
+    feature.switch_view("feature-view")
+
+    main_reloaded = LogManager.load(logdir, lock=False)
+    assert main_reloaded.current_view == "main-view"
+    assert [message.content for message in main_reloaded.log] == ["main summary"]
+
+
 def test_undo_more_than_log_length():
     """Regression: undo(n) where n > len(log) should not crash."""
     log = LogManager()
@@ -672,6 +793,106 @@ def test_merge_consecutive_preserves_prompt_cache_boundary():
     ]
 
     assert _merge_consecutive_messages(msgs) == msgs
+
+
+def test_merge_consecutive_does_not_merge_distinct_prompt_generations():
+    """Concat keeps the first message's metadata, so gluing generations would
+    send stale + current instructions under the earlier generation marker."""
+    msgs = [
+        Message(
+            "system",
+            "old prompt",
+            pinned=True,
+            metadata={"prompt_generation": "one"},
+        ),
+        Message(
+            "system",
+            "new prompt",
+            pinned=True,
+            metadata={"prompt_generation": "two"},
+        ),
+    ]
+    result = _merge_consecutive_messages(msgs)
+    assert len(result) == 2
+    assert result[0].content == "old prompt"
+    assert result[1].content == "new prompt"
+
+
+def test_prepare_messages_selects_generation_before_merging_across_ui_only():
+    """A ui_only status between two prompt generations must not glue them.
+
+    Filter → merge → select-generation would concatenate both prompts while
+    keeping the older generation marker, so the provider would receive stale
+    instructions. Select the active generation first.
+    """
+    gen1 = Message(
+        "system",
+        "old prompt",
+        pinned=True,
+        hide=True,
+        metadata={"prompt_generation": "one"},
+    )
+    status = Message("system", "🔄 Auto-compacted conversation", ui_only=True)
+    gen2 = Message(
+        "system",
+        "new prompt",
+        pinned=True,
+        hide=True,
+        metadata={"prompt_generation": "two"},
+    )
+    user = Message("user", "hello")
+    assistant = Message("assistant", "hi")
+
+    prepared = prepare_messages([gen1, status, gen2, user, assistant])
+    contents = "\n".join(m.content for m in prepared)
+
+    assert "old prompt" not in contents
+    assert "new prompt" in contents
+    assert "Auto-compacted" not in contents
+    assert all(not m.ui_only for m in prepared)
+
+
+def test_prepare_messages_still_merges_same_role_turns_split_by_ui_only():
+    """Dropping a ui_only separator must not leave consecutive same-role turns."""
+    prepared = prepare_messages(
+        [
+            Message("user", "first"),
+            Message("system", "status", ui_only=True),
+            Message("user", "second"),
+            Message("assistant", "ok"),
+        ]
+    )
+    users = [m for m in prepared if m.role == "user"]
+    assert len(users) == 1
+    assert "first" in users[0].content
+    assert "second" in users[0].content
+
+
+def test_prepare_messages_merges_same_role_after_generation_reorder():
+    """A single generation between two user turns reorders without a length
+    change ([user, gen, user2] → [gen, user, user2] is 3→3). The early merge
+    must still run so the provider sees one user turn, not two consecutive.
+    """
+    gen = Message(
+        "system",
+        "prompt",
+        pinned=True,
+        hide=True,
+        metadata={"prompt_generation": "one"},
+    )
+    prepared = prepare_messages(
+        [
+            Message("user", "first"),
+            gen,
+            Message("user", "second"),
+            Message("assistant", "ok"),
+        ]
+    )
+    users = [m for m in prepared if m.role == "user"]
+    assert len(users) == 1
+    assert "first" in users[0].content
+    assert "second" in users[0].content
+    assert "prompt" in "\n".join(m.content for m in prepared)
 
 
 def test_read_jsonl_unknown_field(tmp_path):

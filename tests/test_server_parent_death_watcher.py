@@ -18,6 +18,7 @@ pytest.importorskip(
 from gptme.server.cli import (
     _install_sigterm_handler,
     _pid_alive,
+    _start_background_mcp,
     _start_parent_death_watcher,
 )
 
@@ -29,7 +30,41 @@ def test_pid_alive_for_self():
 def test_pid_alive_returns_false_for_dead_pid():
     # PID 0 / very high never-allocated PIDs always look dead.
     # PID 1 is init/launchd, always alive on POSIX, so use a guaranteed-dead pid.
+    # On Windows this must not call os.kill(pid, 0): that is WinError 87, and
+    # the PyInstaller CRT aborts the Tauri sidecar ("Aborted!") instead of raising.
     assert not _pid_alive(2_147_483_646)
+
+
+def test_background_mcp_waits_for_http_listener(monkeypatch: pytest.MonkeyPatch):
+    """MCP discovery must not begin until the server listener is reachable."""
+    calls: list[str] = []
+    completed = threading.Event()
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_create_connection(*_args, **_kwargs):
+        calls.append("listener")
+        return _Connection()
+
+    def fake_init_tools(_allowlist, *, include_mcp: bool):
+        assert include_mcp is True
+        calls.append("mcp")
+        completed.set()
+
+    monkeypatch.setattr(
+        "gptme.server.cli.socket.create_connection", fake_create_connection
+    )
+    monkeypatch.setattr("gptme.tools.init_tools", fake_init_tools)
+
+    _start_background_mcp(["shell"], "127.0.0.1", 5700, listen_timeout=0.1)
+
+    assert completed.wait(1.0)
+    assert calls == ["listener", "mcp"]
 
 
 def test_watcher_skips_when_already_orphaned():

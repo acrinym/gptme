@@ -172,6 +172,11 @@ class ModelMeta:
     # Subscription models preserve token counts but have zero marginal USD cost.
     pricing_type: Literal["per_token", "subscription"] = "per_token"
 
+    # Explicit default compaction budget for models validated near their full
+    # window. None applies the conservative long-window cap. Kept last to avoid
+    # shifting the existing positional constructor fields.
+    context_budget: float | int | None = None
+
     @property
     def full(self) -> str:
         # For unknown providers (including custom providers), the model field
@@ -211,8 +216,8 @@ class ProviderPlugin:
 
         provider = ProviderPlugin(
             name="minimax",
-            api_key_env="MINIMAX_API_KEY",
             base_url="https://api.minimax.chat/v1",
+            api_key_env="MINIMAX_API_KEY",
             models=[
                 ModelMeta(
                     provider="unknown",
@@ -233,16 +238,37 @@ class ProviderPlugin:
                 ),
             ],
         )
+
+    For providers that do not use an API key (e.g. those authenticating via
+    per-request payment or a custom ``init`` function), omit ``api_key_env``::
+
+        provider = ProviderPlugin(
+            name="blockrun",
+            base_url="https://api.blockrun.ai/v1",
+            # api_key_env omitted — BlockRun uses x402 per-request payment
+            models=[...],
+        )
     """
 
     name: str
     """Provider name, e.g. ``"minimax"``.  Must be unique across all installed providers."""
 
-    api_key_env: str
-    """Name of the environment variable that holds the API key, e.g. ``"MINIMAX_API_KEY"``."""
+    api_key_env: str | None = None
+    """Name of the environment variable that holds the API key, e.g. ``"MINIMAX_API_KEY"``.
 
-    base_url: str
+    Set to ``None`` for providers that do not use an API key (e.g. those using
+    per-request payment or a custom :attr:`init` function that handles auth).
+
+    .. note:: Field order is preserved from when this field was required, so
+       existing positional constructions ``ProviderPlugin(name, api_key_env,
+       base_url)`` keep working."""
+
+    base_url: str = ""
     """Base URL for the OpenAI-compatible API endpoint, e.g. ``"https://api.minimax.chat/v1"``."""
+    """Name of the environment variable that holds the API key, e.g. ``"MINIMAX_API_KEY"``.
+
+    Set to ``None`` for providers that do not use an API key (e.g. those using
+    per-request payment or a custom :attr:`init` function that handles auth)."""
 
     models: list["ModelMeta"] = field(default_factory=list)
     """List of :class:`ModelMeta` objects describing the available models.
@@ -266,6 +292,7 @@ class ProviderPlugin:
 class _ModelDictMeta(TypedDict):
     context: int
     max_output: NotRequired[int]
+    context_budget: NotRequired[float | int]
 
     # price in USD per 1M tokens
     price_input: NotRequired[float]

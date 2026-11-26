@@ -171,6 +171,23 @@ describe('ConfigFileEditor', () => {
     expect(screen.getByLabelText('gptme config TOML')).toHaveValue(configResponse.content);
   });
 
+  it('surfaces nested API error objects instead of [object Object]', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({
+        error: { message: 'Cannot read config.toml: permission denied' },
+      }),
+    });
+
+    render(<ConfigFileEditor />);
+
+    expect(
+      await screen.findByText('Cannot read config.toml: permission denied')
+    ).toBeInTheDocument();
+    expect(screen.queryByText('[object Object]')).not.toBeInTheDocument();
+  });
+
   it.each([false, undefined])(
     'does not show runtime notice when runtime presence is %s',
     async (runtimeExists) => {

@@ -1,9 +1,14 @@
 """Tests for the Textual TUI (requires the `tui` extra)."""
 
+import signal
+import sys
+
 import pytest
 
 pytest.importorskip("textual")
 
+from rich.panel import Panel
+from rich.text import Text
 from textual.color import Color
 from textual.filter import ANSIToTruecolor
 from textual.widgets import Collapsible, Static
@@ -14,6 +19,7 @@ from gptme.tui.app import (
     AssistantMessage,
     BouncingError,
     ChatInput,
+    ConfirmScreen,
     CostMessage,
     GptmeApp,
     InfoMessage,
@@ -30,9 +36,11 @@ from gptme.tui.app import (
     _split_thinking,
     _split_tool_calls,
     _split_xml_tool_calls,
+    _strip_thinking,
     _summarize,
     _tool_call_renderable,
     _xml_tool_renderables,
+    complete_input,
     renderables_for_message,
 )
 
@@ -77,7 +85,14 @@ async def test_active_surfaces_use_ansi_default_background(tmp_path):
         assert app.screen.styles.background == expected
         assert app.screen.styles.height is None
         assert app.screen.styles.max_height is None
-        for selector in ("#chat", "#bottom", "#input", "#input-hint", "#status"):
+        for selector in (
+            "#chat",
+            "#bottom",
+            "#input-row",
+            "#input",
+            "#status-row",
+            "#status",
+        ):
             assert app.query_one(selector).styles.background == expected
 
 
@@ -166,19 +181,31 @@ async def test_queue_while_generating(tmp_path):
 async def test_toggle_outputs(tmp_path):
     manager = make_manager(
         tmp_path,
-        [Message("system", "some output"), Message("system", "more output")],
+        [
+            Message("system", "some output\nline 2"),
+            Message("system", "more output\nline 2"),
+            Message("assistant", "<think>\nreasoning\n</think>\nAnswer"),
+        ],
     )
     app = GptmeApp(manager, workspace=tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         collapsibles = list(app.query(Collapsible))
+        assert any(c.has_class("thinking-block") for c in collapsibles)
         assert all(c.collapsed for c in collapsibles)
+        # Ctrl+O expands outputs and thinking together
         await pilot.press("ctrl+o")
         await pilot.pause()
         assert all(not c.collapsed for c in collapsibles)
+        assert app.show_thinking
         await pilot.press("ctrl+o")
         await pilot.pause()
         assert all(c.collapsed for c in collapsibles)
+        # partially expanded (thinking only): Ctrl+O expands everything
+        app._set_thinking(True)
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert all(not c.collapsed for c in collapsibles)
 
 
 @pytest.mark.asyncio
@@ -896,6 +923,26 @@ def test_split_thinking_only_block():
     assert "inner" in result[0][1]
 
 
+def test_split_thinking_unclosed_block():
+    """An interrupted response ending inside <think> is still thinking.
+
+    Hidden mode uses this split for completed inline output; treating the
+    unclosed tail as ordinary content would leak the reasoning.
+    """
+    result = _split_thinking("<think>\nsecret plan")
+    assert result == [(True, "secret plan")]
+
+    result = _split_thinking("visible\n<thinking>\npartial")
+    assert any(not is_think and "visible" in text for is_think, text in result)
+    assert any(is_think and "partial" in text for is_think, text in result)
+    assert all("partial" not in text or is_think for is_think, text in result)
+
+    result = _split_thinking("<think>a</think>\nkeep\n<think>\nopen")
+    assert any(is_think and "a" in text for is_think, text in result)
+    assert any(not is_think and "keep" in text for is_think, text in result)
+    assert any(is_think and "open" in text for is_think, text in result)
+
+
 @pytest.mark.asyncio
 async def test_assistant_message_renders_thinking_as_collapsible(tmp_path):
     """AssistantMessage with <think> block renders a Collapsible for the thinking."""
@@ -1325,3 +1372,1161 @@ def test_renderables_for_message_mixed_formats():
     assert len(panels) >= 2, (
         f"expected ≥2 Panels for mixed @tool+XML content, got {len(panels)}"
     )
+
+
+def test_strip_thinking_closed_and_open_blocks():
+    assert _strip_thinking("<think>\nhmm\n</think>\nAnswer") == "\nAnswer"
+    # still streaming: cut the unclosed block
+    assert _strip_thinking("Hi\n<thinking>\npartial") == "Hi\n"
+    assert _strip_thinking("plain") == "plain"
+
+
+def test_renderables_for_message_hides_thinking():
+    msg = Message("assistant", "<think>\na\nb\n</think>\nFinal answer.")
+    hidden = renderables_for_message(msg, show_thinking=False)
+    assert not any(isinstance(r, Panel) and r.title == "Thinking" for r in hidden), (
+        "thinking panel should be replaced by a stub"
+    )
+    assert any("2 lines hidden" in str(r) for r in hidden if isinstance(r, Text))
+    shown = renderables_for_message(msg, show_thinking=True)
+    assert any(isinstance(r, Panel) and r.title == "Thinking" for r in shown)
+
+
+def test_renderables_for_message_hides_unclosed_thinking():
+    """Interrupted <think> must not leak as ordinary markdown when hidden."""
+    msg = Message("assistant", "<think>\nsecret plan")
+    hidden = renderables_for_message(msg, show_thinking=False)
+    blobs = " ".join(str(r) for r in hidden)
+    assert "secret plan" not in blobs
+    assert any("hidden" in str(r) for r in hidden if isinstance(r, Text))
+    shown = renderables_for_message(msg, show_thinking=True)
+    assert any(isinstance(r, Panel) and r.title == "Thinking" for r in shown)
+
+
+def test_thinking_hidden_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("GPTME_TUI_DISPLAY_THINKING", raising=False)
+    assert not GptmeApp(make_manager(tmp_path), workspace=tmp_path).show_thinking
+    monkeypatch.setenv("GPTME_TUI_DISPLAY_THINKING", "1")
+    assert GptmeApp(make_manager(tmp_path), workspace=tmp_path).show_thinking
+
+
+def test_complete_input_tui_commands():
+    assert "/display" in complete_input("/disp")
+    assert complete_input("/display ") == [
+        "/display thinking",
+        "/display outputs",
+        "/display hidden",
+        "/display highlight",
+    ]
+    assert complete_input("/display thinking o") == [
+        "/display thinking on",
+        "/display thinking off",
+    ]
+    assert complete_input("/display thinking on ") == []
+
+
+@pytest.mark.asyncio
+async def test_display_thinking_toggles_collapsibles(tmp_path, monkeypatch):
+    monkeypatch.delenv("GPTME_TUI_DISPLAY_THINKING", raising=False)
+    manager = make_manager(
+        tmp_path, [Message("assistant", "<think>\nreasoning\n</think>\nAnswer")]
+    )
+    app = GptmeApp(manager, workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        block = app.query(".thinking-block").results(Collapsible).__next__()
+        assert block.collapsed
+        inp = app.query_one("#input", ChatInput)
+        for text, expanded in [
+            ("/display thinking", True),
+            ("/display thinking off", False),
+        ]:
+            inp.text = text
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.show_thinking is expanded
+            assert block.collapsed is not expanded
+        # display-only toggle stays available while the agent works
+        app.generating = True
+        inp.text = "/display thinking on"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.show_thinking
+        # outputs toggle leaves thinking alone
+        inp.text = "/display outputs off"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not app._outputs_expanded
+        assert not block.collapsed
+
+
+@pytest.mark.asyncio
+async def test_inline_stream_preview_hides_thinking(tmp_path, monkeypatch):
+    monkeypatch.delenv("GPTME_TUI_DISPLAY_THINKING", raising=False)
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path, inline=True)
+    async with app.run_test() as pilot:
+        app._begin_stream()
+        app._on_stream_token("<think>\nsecret reasoning")
+        await pilot.pause()
+        live = app.query_one("#live")
+        assert "secret" not in str(live.render())
+        assert "Thinking" in str(live.render())
+        app._on_stream_token("\n</think>\nvisible answer")
+        await pilot.pause()
+        assert "visible answer" in str(live.render())
+        assert "secret" not in str(live.render())
+
+
+@pytest.mark.asyncio
+async def test_inline_resize_without_textual_caret_attr(tmp_path):
+    """First SIGWINCH must not crash if Textual has not parked a caret yet."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path, inline=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        driver = app._driver
+        assert driver is not None
+        writes: list[str] = []
+        original_write = driver.write
+
+        def capture(data: str) -> None:
+            writes.append(data)
+            original_write(data)
+
+        driver.write = capture  # type: ignore[method-assign]
+        if hasattr(app, "_previous_cursor_position"):
+            delattr(app, "_previous_cursor_position")
+        app._on_inline_resize()
+        assert any("\x1b[J" in chunk for chunk in writes)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGWINCH"), reason="no SIGWINCH")
+@pytest.mark.asyncio
+async def test_inline_resize_handler_reset_on_unmount(tmp_path):
+    """Unmount must drop the custom SIGWINCH handler (headless driver won't)."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path, inline=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._inline_sigwinch_installed
+        assert signal.getsignal(signal.SIGWINCH) is not signal.SIG_DFL
+    assert not app._inline_sigwinch_installed
+    assert signal.getsignal(signal.SIGWINCH) is signal.SIG_DFL
+
+
+@pytest.mark.asyncio
+async def test_inline_queued_prompts_visible(tmp_path):
+    manager = make_manager(tmp_path, [Message("user", "hello")])
+    app = GptmeApp(manager, workspace=tmp_path, inline=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.generating = True
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "queued prompt"
+        await pilot.press("enter")
+        await pilot.pause()
+        queued = app.query_one("#queued", Static)
+        assert "queued prompt" in str(queued.render())
+        # interrupting hands the text back and clears the queued view
+        app._interrupt_event.set()
+        await app._generation_done()
+        await pilot.pause()
+        assert "queued prompt" not in str(queued.render())
+        assert inp.text == "queued prompt"
+
+
+@pytest.mark.asyncio
+async def test_confirm_help_precedes_preview(tmp_path):
+    """Key hints must not be clipped away by a tall preview."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(ConfirmScreen(None, "echo hi\n" * 100))
+        await pilot.pause()
+        dialog = app.screen.query_one("#confirm-dialog")
+        ids = [child.id for child in dialog.children]
+        assert ids.index("confirm-help") < ids.index("confirm-preview")
+
+
+@pytest.mark.asyncio
+async def test_restart_command_exits_for_reexec(tmp_path):
+    """/restart can't prompt or exec under Textual: exit and let main() re-exec."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/restart"
+        await pilot.press("enter")
+        await pilot.pause()
+    assert app.restart_requested
+
+
+def test_restart_runs_session_end_before_reexec(tmp_path, monkeypatch):
+    """/restart must fire SESSION_END before os.execv (shell + subagent cleanup)."""
+    from gptme.tui.main import _finish_session
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    app.restart_requested = True
+    order: list[object] = []
+    monkeypatch.setattr(app, "end_session", lambda: order.append("end"))
+    monkeypatch.setattr(
+        "gptme.tools.restart._do_restart",
+        lambda name, **kw: order.append(("restart", name)),
+    )
+    _finish_session(app, "conv")
+    assert order == ["end", ("restart", "conv")]
+
+
+def test_normal_exit_runs_session_end_without_reexec(tmp_path, monkeypatch):
+    from gptme.tui.main import _finish_session
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    called: list[object] = []
+    monkeypatch.setattr(app, "end_session", lambda: called.append("end"))
+    monkeypatch.setattr(
+        "gptme.tools.restart._do_restart",
+        lambda name, **kw: called.append("restart"),
+    )
+    _finish_session(app, "conv")
+    assert called == ["end"]
+
+
+@pytest.mark.asyncio
+async def test_restart_cli_requests_switch(tmp_path):
+    """/restart cli exits the TUI with the CLI as re-exec target."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/restart cli"
+        await pilot.press("enter")
+        await pilot.pause()
+    assert app.restart_requested
+    assert app.restart_target == "cli"
+    assert app.restart_web_url is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arg", ["bogus", "web"])
+async def test_restart_bad_target_keeps_session(tmp_path, monkeypatch, arg):
+    """An unknown target, or /restart web without a server, doesn't exit."""
+    monkeypatch.setattr("gptme.tools.restart._http_status", lambda *a, **kw: None)
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = f"/restart {arg}"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.is_running
+    assert not app.restart_requested
+
+
+@pytest.mark.asyncio
+async def test_restart_web_requests_browser(tmp_path, monkeypatch):
+    """The web check runs in a worker thread, then the app exits to the UI."""
+    monkeypatch.setattr(
+        "gptme.tui.app.prepare_web_switch",
+        lambda name: f"http://127.0.0.1:5700/chat/{name}",
+    )
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/restart web"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+    assert app.restart_requested
+    name = app.manager.logdir.name
+    assert app.restart_web_url == f"http://127.0.0.1:5700/chat/{name}"
+
+
+@pytest.mark.asyncio
+async def test_input_during_web_check_cancels_switch(tmp_path, monkeypatch):
+    """A prompt submitted while /restart web is checked must not be lost."""
+    import threading
+
+    release = threading.Event()
+
+    def slow_prepare(name):
+        release.wait(5)
+        return f"http://127.0.0.1:5700/chat/{name}"
+
+    monkeypatch.setattr("gptme.tui.app.prepare_web_switch", slow_prepare)
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/restart web"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._web_restart_pending is not None
+        # stand-in for a prompt submission (e.g. one awaiting URL confirmation)
+        monkeypatch.setattr(app, "_submit", lambda text: _noop())
+        inp.text = "look at https://example.com"
+        await pilot.press("enter")
+        await pilot.pause()
+        release.set()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.is_running
+    assert not app.restart_requested
+
+
+async def _noop() -> None:
+    return None
+
+
+def test_stale_web_check_is_ignored(tmp_path, monkeypatch):
+    """Only the most recent /restart web check may act."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    requested: list[object] = []
+    monkeypatch.setattr(app, "_request_restart", lambda *a: requested.append(a))
+    monkeypatch.setattr(app, "_show_info", lambda *a: requested.append(a))
+    app._web_restart_pending = 2  # a newer check (#2) superseded #1
+    app._finish_web_check(1, None, "http://old/chat/c")
+    app._finish_web_check(1, "old error")
+    assert requested == []
+    app._finish_web_check(2, None, "http://new/chat/c")
+    assert requested == [(None, "http://new/chat/c")]
+    assert app._web_restart_pending is None
+
+
+def test_restart_request_refused_while_generating(tmp_path, monkeypatch):
+    """A prompt sent while the web check ran wins: don't exit mid-generation."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    infos: list[str] = []
+    monkeypatch.setattr(app, "_show_info", lambda text, *a: infos.append(text))
+    monkeypatch.setattr(app, "exit", lambda *a, **kw: infos.append("exit"))
+    app.generating = True
+    app._request_restart(None, "http://127.0.0.1:5700/chat/c")
+    assert not app.restart_requested
+    assert "exit" not in infos
+
+
+def test_finish_session_switches_to_cli(tmp_path, monkeypatch):
+    from gptme.tui.main import _finish_session
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    app.restart_requested = True
+    app.restart_target = "cli"
+    calls: list[object] = []
+    monkeypatch.setattr(app, "end_session", lambda: calls.append("end"))
+    monkeypatch.setattr(
+        "gptme.tools.restart._do_restart",
+        lambda name, **kw: calls.append((name, kw)),
+    )
+    _finish_session(app, "conv")
+    assert calls == ["end", ("conv", {"target": "cli", "source": "tui"})]
+
+
+def test_finish_session_opens_web_without_reexec(tmp_path, monkeypatch):
+    from gptme.tui.main import _finish_session
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    app.restart_requested = True
+    app.restart_web_url = "http://127.0.0.1:5700/chat/conv"
+    calls: list[object] = []
+    monkeypatch.setattr(app, "end_session", lambda: calls.append("end"))
+    monkeypatch.setattr(
+        "gptme.tools.restart._do_restart",
+        lambda name, **kw: calls.append("restart"),
+    )
+    monkeypatch.setattr(
+        "gptme.tools.restart.open_web", lambda url: calls.append(("web", url))
+    )
+    _finish_session(app, "conv")
+    assert calls == ["end", ("web", "http://127.0.0.1:5700/chat/conv")]
+
+
+def test_end_session_prints_cost_summary(tmp_path, capsys):
+    """Exiting the TUI fires SESSION_END in the chat context (cost summary)."""
+    from gptme.hooks import HookType, register_hook, unregister_hook
+    from gptme.hooks.cost_awareness import session_end_cost_summary
+    from gptme.util.cost_tracker import CostEntry, CostTracker
+
+    register_hook("test.cost_summary", HookType.SESSION_END, session_end_cost_summary)
+    try:
+        app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+        entry = CostEntry(
+            timestamp=0.0,
+            model="test",
+            input_tokens=2000,
+            output_tokens=100,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            cost=0.25,
+        )
+        app._chat_ctx.run(CostTracker.record, entry)
+        app.end_session()
+    finally:
+        unregister_hook("test.cost_summary", HookType.SESSION_END)
+    assert "Session: $0.25" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_ctrl_d_quits_only_on_empty_input(tmp_path):
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "draft"
+        inp.move_cursor((0, 0))
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        assert app.is_running
+        assert inp.text == "raft"  # deleted forward instead
+        inp.text = ""
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+        assert not app.is_running
+
+
+@pytest.mark.asyncio
+async def test_status_shows_session_cost(tmp_path):
+    from gptme.util.cost_tracker import CostEntry, CostTracker
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        status = app.query_one("#status", Static)
+        assert "$" not in str(status.render())
+        entry = CostEntry(
+            timestamp=0.0,
+            model="test",
+            input_tokens=1000,
+            output_tokens=10,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            cost=0.123,
+        )
+        app._chat_ctx.run(CostTracker.record, entry)
+        app._update_status()
+        await pilot.pause()
+        assert "$0.12" in str(status.render())
+
+
+@pytest.mark.asyncio
+async def test_inline_queued_view_summarizes_overflow(tmp_path):
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path, inline=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.prompt_queue = [f"prompt {i}" for i in range(8)]
+        app._update_queued_view()
+        await pilot.pause()
+        rendered = str(app.query_one("#queued", Static).render())
+        assert rendered.count("⏳ queued") == 4
+        assert "+4 more queued" in rendered
+
+
+@pytest.mark.asyncio
+async def test_tool_call_collapsible_has_single_marker(tmp_path):
+    """Collapsible draws its own ▶; the title must not add another."""
+    content = "Running it:\n```shell\nls\n```"
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        widget = AssistantMessage(content)
+        await app.mount(widget)
+        await pilot.pause()
+        block = widget.query(".tool-call-block").results(Collapsible).__next__()
+        assert str(block.title) == "shell: ls"
+
+
+def test_system_display_text_strips_wrapper_tags():
+    from gptme.tui.app import _system_display_text
+
+    assert (
+        _system_display_text(
+            "<system_info>Working directory changed to: /x</system_info>"
+        )
+        == "Working directory changed to: /x"
+    )
+    assert _system_display_text("plain output") == "plain output"
+    # only a tag wrapping the whole message is stripped
+    assert _system_display_text("a <system_info>b</system_info>") == (
+        "a <system_info>b</system_info>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_line_system_message_not_collapsible(tmp_path):
+    manager = make_manager(
+        tmp_path, [Message("system", "<system_info>cwd is /x</system_info>")]
+    )
+    app = GptmeApp(manager, workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        widget = app.query_one(SystemMessage)
+        assert not widget.query(Collapsible)
+        assert "cwd is /x" in str(widget.query_one(Static).render())
+        assert "system_info" not in str(widget.query_one(Static).render())
+
+
+def test_renderables_one_line_system_message():
+    msg = Message("system", "<system_info>cwd is /x</system_info>")
+    rendered = [str(r) for r in renderables_for_message(msg)]
+    assert rendered[0] == "cwd is /x"
+
+
+@pytest.mark.asyncio
+async def test_hidden_step_messages_not_shown(tmp_path):
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._on_step_message(
+            Message("system", "<system_warning>Token usage</system_warning>", hide=True)
+        )
+        await pilot.pause()
+        assert not app.query(SystemMessage)
+
+
+@pytest.mark.asyncio
+async def test_display_hidden_toggles_hidden_messages(tmp_path, monkeypatch):
+    monkeypatch.delenv("GPTME_TUI_DISPLAY_HIDDEN", raising=False)
+    manager = make_manager(
+        tmp_path,
+        [
+            Message("user", "hi"),
+            Message("system", "<system_info>secret notice</system_info>", hide=True),
+        ],
+    )
+    app = GptmeApp(manager, workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not app.query(SystemMessage)
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/display hidden on"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.show_hidden
+        assert any(
+            "secret notice" in str(s.render())
+            for w in app.query(SystemMessage)
+            for s in w.query(Static)
+        )
+        # live hidden messages follow the setting
+        app._on_step_message(Message("system", "another notice", hide=True))
+        await pilot.pause()
+        assert len(app.query(SystemMessage)) >= 2
+        inp.text = "/display hidden off"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not app.query(SystemMessage)
+
+
+def test_role_labels_use_configured_names(monkeypatch):
+    from types import SimpleNamespace
+
+    from gptme.tui import app as tui_app
+
+    config = SimpleNamespace(
+        user=SimpleNamespace(user=SimpleNamespace(name="Erik")),
+        chat=SimpleNamespace(agent_config=SimpleNamespace(name="Bob")),
+    )
+    monkeypatch.setattr(tui_app, "get_config", lambda: config)
+    assert tui_app._role_label("user") == "Erik"
+    assert tui_app._role_label("assistant") == "Bob"
+    assert tui_app._role_label("system") == "System"
+    rendered = renderables_for_message(Message("assistant", "hi"))
+    assert str(rendered[0]) == "Bob"
+
+    config.chat = None
+    assert tui_app._role_label("assistant") == "Assistant"
+
+
+@pytest.mark.asyncio
+async def test_long_paste_collapses_to_placeholder(tmp_path):
+    from textual import events
+
+    manager = make_manager(tmp_path, [Message("user", "hello")])
+    app = GptmeApp(manager, workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.generating = True  # submissions queue, so we can inspect them
+        inp = app.query_one("#input", ChatInput)
+        pasted = "line 1\nline 2\nline 3"
+        app.post_message(events.Paste(pasted))
+        await pilot.pause()
+        assert inp.text == "[Pasted text #1 +3 lines]"
+        await pilot.press("space", "o", "k")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.prompt_queue == [f"{pasted} ok"]
+
+        # short pastes are inserted as-is
+        app.post_message(events.Paste("short"))
+        await pilot.pause()
+        assert inp.text == "short"
+
+        # backspace at the end of a placeholder removes the whole token
+        inp.text = ""
+        app.post_message(events.Paste("x" * 900))
+        await pilot.pause()
+        assert inp.text == "[Pasted text #1 900 chars]"
+        await pilot.press("backspace")
+        await pilot.pause()
+        assert inp.text == ""
+
+
+@pytest.mark.asyncio
+async def test_paste_placeholder_is_atomic(tmp_path):
+    """The cursor can't enter a placeholder; Delete/Backspace remove it whole."""
+    from textual import events
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        await pilot.press("a")
+        app.post_message(events.Paste("1\n2\n3"))
+        await pilot.pause()
+        await pilot.press("b")
+        label = "[Pasted text #1 +3 lines]"
+        assert inp.text == f"a{label}b"
+        end = 1 + len(label)
+        # moving left from after the token jumps over it
+        await pilot.press("left")  # before "b"
+        await pilot.press("left")
+        assert inp.cursor_location == (0, 1)
+        # moving right from before the token jumps over it
+        await pilot.press("right")
+        assert inp.cursor_location == (0, end)
+        # placing the cursor inside snaps to the nearest edge
+        inp.move_cursor((0, 3))
+        await pilot.pause()
+        assert inp.cursor_location == (0, 1)
+        # Delete at the start removes the whole token
+        await pilot.press("delete")
+        await pilot.pause()
+        assert inp.text == "ab"
+
+
+@pytest.mark.asyncio
+async def test_paste_placeholder_survives_other_edits(tmp_path):
+    """Word/line deletes remove whole tokens; expansion is a single pass."""
+    from textual import events
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        await pilot.press("x", "space")
+        app.post_message(events.Paste("1\n2\n3"))
+        await pilot.pause()
+        # a word-delete at the end of the token takes the whole token
+        inp.action_delete_word_left()
+        await pilot.pause()
+        assert inp.text == "x "
+
+        # pasted text containing a later label is not re-expanded
+        app.post_message(events.Paste("see [Pasted text #2 +3 lines]\n2\n3"))
+        await pilot.pause()
+        app.post_message(events.Paste("a\nb\nc"))
+        await pilot.pause()
+        assert inp._expand_pastes(inp.text) == (
+            "x see [Pasted text #2 +3 lines]\n2\n3a\nb\nc"
+        )
+
+
+def test_tui_accepts_prompt_arguments():
+    from gptme.tui.main import main
+    from gptme.util.multiprompt import group_prompt_args
+
+    params = main.make_context("gptme-tui", ["write it", "-", "test it"]).params
+    assert params["prompts"] == ("write it", "-", "test it")
+    # same grouping as the CLI
+    assert group_prompt_args(params["prompts"]) == ["write it", "test it"]
+
+
+def test_tui_accepts_option_like_prompts():
+    from gptme.tui.main import main
+
+    params = main.make_context("gptme-tui", ["-foo"]).params
+    assert params["prompts"] == ("-foo",)
+
+
+@pytest.mark.asyncio
+async def test_initial_prompts_submit_first_and_queue_rest(tmp_path, monkeypatch):
+    app = GptmeApp(
+        make_manager(tmp_path), workspace=tmp_path, initial_prompts=["one", "two"]
+    )
+    started: list[bool] = []
+
+    def fake_start() -> None:
+        started.append(True)
+        app.generating = True
+
+    monkeypatch.setattr(app, "_start_generation", fake_start)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert [m.content for m in app.manager.log if m.role == "user"] == ["one"]
+        assert app.prompt_queue == ["two"]
+        assert started
+        assert app.generating is True
+        widgets = app._queued_widgets
+        assert len(widgets) == 1
+        assert isinstance(widgets[0], UserMessage)
+        assert widgets[0].content == "two"
+
+
+@pytest.mark.asyncio
+async def test_rebuild_chat_keeps_queued_prompt_visible(tmp_path, monkeypatch):
+    """Queued prompts are TUI-only; rebuilding from the log must remount them."""
+    app = GptmeApp(
+        make_manager(tmp_path), workspace=tmp_path, initial_prompts=["one", "two"]
+    )
+
+    def fake_start() -> None:
+        app.generating = True
+
+    monkeypatch.setattr(app, "_start_generation", fake_start)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert app.prompt_queue == ["two"]
+        app._rebuild_chat()
+        await pilot.pause()
+        queued = [w for w in app.query(UserMessage) if "queued" in w.classes]
+        assert len(queued) == 1
+        assert queued[0].content == "two"
+        assert app._queued_widgets == queued
+        # popping after a rebuild must remove the remounted widget, not crash
+        await app._generation_done()
+        await pilot.pause()
+        assert app.prompt_queue == []
+        assert not any("queued" in w.classes for w in app.query(UserMessage))
+        assert [m.content for m in app.manager.log if m.role == "user"] == [
+            "one",
+            "two",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_initial_prompts_submit_next_when_turn_finishes(tmp_path, monkeypatch):
+    app = GptmeApp(
+        make_manager(tmp_path), workspace=tmp_path, initial_prompts=["one", "two"]
+    )
+    started: list[int] = []
+
+    def fake_start() -> None:
+        started.append(1)
+        app.generating = True
+
+    monkeypatch.setattr(app, "_start_generation", fake_start)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert app.prompt_queue == ["two"]
+        await app._generation_done()
+        await pilot.pause()
+        assert [m.content for m in app.manager.log if m.role == "user"] == [
+            "one",
+            "two",
+        ]
+        assert app.prompt_queue == []
+        assert len(started) == 2
+
+
+@pytest.mark.asyncio
+async def test_initial_slash_command_uses_command_handler(tmp_path, monkeypatch):
+    app = GptmeApp(
+        make_manager(tmp_path),
+        workspace=tmp_path,
+        initial_prompts=["/model mock/echo", "hello"],
+    )
+    handled: list[str] = []
+    started: list[str] = []
+    monkeypatch.setattr(app, "_handle_command", lambda text: handled.append(text))
+    monkeypatch.setattr(app, "_start_generation", lambda: started.append("gen"))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert handled == ["/model mock/echo"]
+        assert [m.content for m in app.manager.log if m.role == "user"] == ["hello"]
+        assert started == ["gen"]
+        assert app.prompt_queue == []
+
+
+@pytest.mark.asyncio
+async def test_initial_quit_command_does_not_drain_queue(tmp_path, monkeypatch):
+    """A queued prompt must not be submitted behind an exiting command."""
+    app = GptmeApp(
+        make_manager(tmp_path),
+        workspace=tmp_path,
+        initial_prompts=["/quit", "hello"],
+    )
+    started: list[str] = []
+    monkeypatch.setattr(app, "_start_generation", lambda: started.append("gen"))
+    # Don't really tear the app down: /quit must not submit the queued prompt
+    # even before the app has finished exiting.
+    monkeypatch.setattr(app, "exit", lambda *args, **kwargs: None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+    assert app._quitting is True
+    assert app.prompt_queue == ["hello"]
+    assert [m.content for m in app.manager.log if m.role == "user"] == []
+    assert started == []
+
+
+@pytest.mark.asyncio
+async def test_initial_quit_command_exits_without_submitting_queue(
+    tmp_path, monkeypatch
+):
+    """The real exit path must unmount without submitting a queued prompt."""
+    app = GptmeApp(
+        make_manager(tmp_path),
+        workspace=tmp_path,
+        initial_prompts=["/quit", "hello"],
+    )
+    started: list[str] = []
+    monkeypatch.setattr(app, "_start_generation", lambda: started.append("gen"))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not app.is_running
+    assert app._quitting is True
+    assert app.prompt_queue == ["hello"]
+    assert [m.content for m in app.manager.log if m.role == "user"] == []
+    assert started == []
+
+
+def _make_conv(logs_dir, name):
+    (logs_dir / name).mkdir(parents=True)
+    (logs_dir / name / "conversation.jsonl").write_text("{}\n")
+
+
+def test_resume_option_takes_optional_name():
+    from gptme.tui.main import main
+
+    def params(args):
+        return main.make_context("gptme-tui", args).params
+
+    assert params([])["resume"] is None
+    assert params(["--resume"])["resume"] == ""
+    assert params(["--resume", "my-conv"])["resume"] == "my-conv"
+    # an option after the flag isn't taken as the name
+    assert params(["-r", "-m", "mock/echo"])["resume"] == ""
+
+
+def test_select_logdir(tmp_path, monkeypatch):
+    import importlib
+
+    import click
+
+    from gptme.tui import main as tui_main
+
+    cli_main = importlib.import_module("gptme.cli.main")
+    monkeypatch.setattr(tui_main, "get_logs_dir", lambda: tmp_path)
+    _make_conv(tmp_path, "older")
+    _make_conv(tmp_path, "newer")
+
+    select = tui_main._select_logdir
+    assert select("random", "older") == tmp_path / "older"
+    # CLI spelling: --resume --name older
+    assert select("older", "") == tmp_path / "older"
+    with pytest.raises(click.UsageError, match="No conversation named"):
+        select("random", "missing")
+    # bare --resume picks from a list; it never guesses "the latest"
+    monkeypatch.setattr(cli_main, "pick_log", lambda: tmp_path / "picked")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    assert select("random", "") == tmp_path / "picked"
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    with pytest.raises(click.UsageError, match="needs a terminal"):
+        select("random", "")
+
+
+@pytest.mark.asyncio
+async def test_paste_placeholder_normalizes_line_endings(tmp_path):
+    """Collapsed pastes submit LF line breaks, like TextArea's own insert."""
+    from textual import events
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.generating = True  # submissions queue, so we can inspect them
+        inp = app.query_one("#input", ChatInput)
+        # terminals commonly send CR (or CRLF) line breaks in bracketed paste
+        app.post_message(events.Paste("1\r2\r3"))
+        await pilot.pause()
+        app.post_message(events.Paste("a\r\nb\r\nc"))
+        await pilot.pause()
+        assert inp.text == "[Pasted text #1 +3 lines][Pasted text #2 +3 lines]"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.prompt_queue == ["1\n2\n3a\nb\nc"]
+
+
+@pytest.mark.asyncio
+async def test_paste_placeholder_undo_redo(tmp_path):
+    """Undo restores a whole token after a widened delete; redo removes it."""
+    from textual import events
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        await pilot.press("x", "space")
+        app.post_message(events.Paste("1\n2\n3"))
+        await pilot.pause()
+        token_text = "x [Pasted text #1 +3 lines]"
+        assert inp.text == token_text
+        await pilot.press("backspace")
+        assert inp.text == "x "
+        inp.undo()
+        await pilot.pause()
+        assert inp.text == token_text
+        inp.redo()
+        await pilot.pause()
+        assert inp.text == "x "
+        inp.undo()
+        await pilot.pause()
+        assert inp._expand_pastes(inp.text) == "x 1\n2\n3"
+
+
+@pytest.mark.asyncio
+async def test_terminal_focus_changes_keep_input_focused(tmp_path):
+    """Blur must not drop focus (Textual's default), and focus-in restores it."""
+    from textual import events
+
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        assert not inp.cursor_blink, "steady cursor, like shells"
+        focused_line = inp.render_line(0)
+        app.post_message(events.AppBlur())
+        await pilot.pause()
+        assert app.focused is inp
+        # still focused, but the rendered cursor is gone while the terminal
+        # is unfocused (checks the actual render: TextArea caches lines)
+        assert not inp._draw_cursor
+        assert inp.render_line(0) != focused_line
+        # focus lost some other way: focus-in puts it back on the input
+        app.screen.set_focus(None)
+        app.post_message(events.AppFocus())
+        await pilot.pause()
+        assert app.focused is inp
+        assert inp._draw_cursor
+        assert inp.render_line(0) == focused_line
+
+
+def test_current_dir_recovers_from_stale_cwd(tmp_path, monkeypatch):
+    import click
+
+    from gptme.tui import main as tui_main
+
+    def stale():
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(tui_main.Path, "cwd", staticmethod(stale))
+    monkeypatch.setattr(tui_main.os, "chdir", lambda p: None)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    assert tui_main._current_dir() == tmp_path
+    monkeypatch.setenv("PWD", str(tmp_path / "gone"))
+    with pytest.raises(click.ClickException, match="no longer exists"):
+        tui_main._current_dir()
+
+
+def test_drop_summary_line():
+    from gptme.tui.app import _drop_summary_line
+
+    content = "Shellcheck found potential issues:\n\n```\nSC2044 warning\n```\n"
+    assert _drop_summary_line(content) == "```\nSC2044 warning\n```"
+    # a leading fence is not the title, keep it
+    fenced = "```stdout\nhello\n```"
+    assert _drop_summary_line(fenced) == fenced
+    # nothing but the summary line: keep the content
+    assert _drop_summary_line("just one line") == "just one line"
+
+
+def test_tool_title_highlighting():
+    from gptme.tui.app import _summary_title, _tool_title
+
+    title = _tool_title("▶ shell: ls -la", "bash", highlight=True)
+    assert title.plain == "▶ shell: ls -la"
+    assert title.spans, "expected highlight styles"
+    # Collapsible draws its own marker
+    assert _tool_title("▶ shell: ls", "bash", True, marker=False).plain == "shell: ls"
+    plain = _tool_title("▶ shell: ls", "bash", highlight=False)
+    assert plain.plain == "▶ shell: ls" and not plain.spans
+
+    summary = _summary_title("Ran command: `ls -la` (3 lines)", highlight=True)
+    assert summary.plain == "Ran command: ls -la (3 lines)"
+    assert summary.spans
+    # unmatched backtick stays literal
+    assert _summary_title("a `b", highlight=True).plain == "a `b"
+
+
+def test_tool_format_title_shows_path_not_json():
+    title, code, lang = _tool_call_renderable(
+        '@save(call_1): {"path": "/tmp/x.py", "content": "print(1)"}'
+    )
+    assert title == "▶ save: /tmp/x.py"
+    # the expanded body is the content to be saved, highlighted as its file type
+    assert code == "print(1)"
+    assert lang == "python"
+
+
+def test_patch_renders_as_diff_in_all_formats():
+    patch = "<<<<<<< ORIGINAL\nold line\n=======\nnew line\n>>>>>>> UPDATED"
+    import json
+
+    tool_call = "@patch(c1): " + json.dumps({"path": "a.py", "patch": patch})
+    title, code, lang = _tool_call_renderable(tool_call)
+    assert title == "▶ patch: a.py"
+    assert lang == "diff"
+    assert "-old line" in code and "+new line" in code
+
+    title, code, lang = _markdown_tool_renderable(f"```patch a.py\n{patch}\n```")
+    assert (title, lang) == ("▶ patch: a.py", "diff")
+    assert "-old line" in code and "+new line" in code
+
+    title, code, lang = _markdown_tool_renderable("```save b.md\n# Hi\n```")
+    assert (title, code) == ("▶ save: b.md", "# Hi")
+    assert lang == "markdown"
+
+
+def test_patch_many_renders_per_file_diffs():
+    import json
+
+    patch = "<<<<<<< ORIGINAL\na\n=======\nb\n>>>>>>> UPDATED"
+    patches = json.dumps(
+        [{"path": "x.py", "patch": patch}, {"path": "y.py", "patch": patch}]
+    )
+    tool_call = "@patch_many(c1): " + json.dumps({"patches": patches})
+    title, code, lang = _tool_call_renderable(tool_call)
+    assert title == "▶ patch_many: x.py (+1 more)"
+    assert lang == "diff"
+    assert "--- x.py" in code and "--- y.py" in code and "+b" in code
+
+
+def test_patch_many_empty_patches_does_not_crash():
+    """An empty patches list must still render instead of IndexError."""
+    title, code, lang = _tool_call_renderable('@patch_many(c1): {"patches": []}')
+    assert title == "▶ patch_many"
+    assert code == ""
+    assert lang == "diff"
+
+
+def test_patch_preview_skips_placeholders():
+    """`# ...` separators are not file edits; don't show them as -/+ lines."""
+    import json
+
+    patch = (
+        "<<<<<<< ORIGINAL\n"
+        "old\n"
+        "    # ...\n"
+        "tail\n"
+        "=======\n"
+        "new\n"
+        "    # ...\n"
+        "tail\n"
+        ">>>>>>> UPDATED"
+    )
+    title, code, lang = _tool_call_renderable(
+        "@patch(c1): " + json.dumps({"path": "a.py", "patch": patch})
+    )
+    assert title == "▶ patch: a.py"
+    assert lang == "diff"
+    assert "-old" in code and "+new" in code
+    assert "# ..." not in code
+
+
+def test_tool_format_title_non_string_path():
+    """A numeric path must still render instead of crashing the TUI."""
+    title, code, _lang = _tool_call_renderable(
+        '@save(call_1): {"path": 123, "content": "print(1)"}'
+    )
+    assert title == "▶ save: 123"
+    assert code == "print(1)"
+
+
+@pytest.mark.asyncio
+async def test_display_highlight_and_toggle_refocus(tmp_path):
+    manager = make_manager(
+        tmp_path, [Message("system", "Ran command: `ls`\n```stdout\na\n```")]
+    )
+    app = GptmeApp(manager, workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/display highlight off"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not app.highlight
+        # clicking a section title toggles it; focus goes back to the input
+        title = app.query_one(SystemMessage).query_one(Collapsible)
+        await pilot.click(title)
+        await pilot.pause()
+        assert not title.collapsed
+        assert app.focused is inp
+
+
+def test_configured_role_color_precedence(monkeypatch):
+    from types import SimpleNamespace
+
+    from gptme import constants
+
+    config = SimpleNamespace(
+        user=SimpleNamespace(user=SimpleNamespace(color="magenta")),
+        chat=SimpleNamespace(agent_config=SimpleNamespace(color="#e5a50a")),
+    )
+    monkeypatch.setattr("gptme.config.get_config", lambda: config)
+    monkeypatch.delenv("GPTME_AGENT_COLOR", raising=False)
+    assert constants.configured_role_color("user") == "magenta"
+    assert constants.configured_role_color("assistant") == "#e5a50a"
+    assert constants.configured_role_color("system") is None
+    monkeypatch.setenv("GPTME_AGENT_COLOR", "red")
+    assert constants.configured_role_color("assistant") == "red"
+    config.chat = None
+    monkeypatch.delenv("GPTME_AGENT_COLOR")
+    assert constants.role_color("assistant") == "green"
+
+
+@pytest.mark.asyncio
+async def test_messages_use_configured_role_color(tmp_path, monkeypatch):
+    colors = {"assistant": "#e5a50a"}
+    monkeypatch.setattr(
+        "gptme.tui.app.configured_role_color", lambda role: colors.get(role)
+    )
+    manager = make_manager(
+        tmp_path, [Message("user", "hi"), Message("assistant", "hello")]
+    )
+    app = GptmeApp(manager, workspace=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assistant = app.query_one(AssistantMessage)
+        assert assistant.styles.border_left[1].hex == "#E5A50A"
+        assert assistant.query_one(".role").styles.color.hex == "#E5A50A"
+        # no color configured for the user: theme default kept
+        user = app.query_one(UserMessage)
+        assert user.styles.border_left[1].hex != "#E5A50A"
+
+
+def test_drop_summary_line_keeps_truncated_first_line():
+    """A first line cut short in the title must stay in the expanded body."""
+    from gptme.tui.app import SUMMARY_MAXLEN, _drop_summary_line
+
+    long_first = "x" * (SUMMARY_MAXLEN + 5)
+    content = f"{long_first}\nmore"
+    assert _drop_summary_line(content) == content
+
+
+def test_restart_not_attempted_when_workspace_is_gone(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from gptme.tools import restart
+    from gptme.tui import main as tui_main
+
+    calls: list[str] = []
+    monkeypatch.setattr(restart, "_do_restart", lambda name: calls.append(name))
+    app = SimpleNamespace(
+        end_session=lambda: None,
+        restart_requested=True,
+        restart_web_url=None,
+        restart_target=None,
+        workspace=tmp_path / "gone",
+    )
+    tui_main._finish_session(app, "conv")  # type: ignore[arg-type]
+    assert calls == []
+    assert "Not restarting" in capsys.readouterr().out

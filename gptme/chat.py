@@ -20,7 +20,7 @@ from .constants import (
 from .constants import (
     prompt_user as prompt_user_styled,
 )
-from .hooks import HookType, trigger_hook
+from .hooks import HookType, StopPropagation, trigger_hook
 from .init import init
 from .llm import (
     did_llm_reply_emit_visible_output,
@@ -48,6 +48,7 @@ from .tools import (
     execute_msg,
     get_tools,
 )
+from .tools._url_safety import set_session_allow_hosts
 from .tools.complete import SessionCompleteException
 from .util import console, path_with_tilde
 from .util.auto_naming import MAX_ASSISTANT_MSGS_FOR_NAMING, try_auto_name
@@ -202,6 +203,11 @@ def chat(
         # init
         # Mode detection for confirmation hooks is now handled inside init_hooks()
         init(model, interactive, tool_allowlist, tool_format, no_confirm)
+
+        # Apply session-level host allowlist for web tools (if configured)
+        chat_config = get_config().chat
+        if chat_config is not None:
+            set_session_allow_hosts(chat_config.allow_hosts)
 
         # Trigger session start hooks
         if session_start_msgs := trigger_hook(
@@ -469,7 +475,7 @@ def _run_chat_loop(
                         )
                         break
                     prompt_queue.append(msg)
-                    if not is_output_json():
+                    if not is_output_json() and not is_output_quiet():
                         console.log(f"[Loop control] {msg.content[:100]}...")
                 continue  # Process the queued messages
 
@@ -596,6 +602,8 @@ def _process_message_conversation(
                 console.log("Execution declined, returning to prompt.")
             break
 
+        pending_continuation = _has_pending_tooluse(manager.log)
+        mid_turn_compacted = _run_post_tool_compaction(manager)
         # Auto-generate display name in background thread to avoid blocking.
         # Shared logic with server in gptme/util/auto_naming.py::try_auto_name.
         # Pre-check assistant count to avoid spawning threads + doing disk I/O
@@ -627,14 +635,21 @@ def _process_message_conversation(
             )
             break
 
-        # Check if there are any runnable tools left
-        last_content = next(
-            (m.content for m in reversed(manager.log) if m.role == "assistant"),
-            "",
-        )
-        has_runnable = any(
-            tooluse.is_runnable for tooluse in ToolUse.iter_from_content(last_content)
-        )
+        # Check if there are any runnable tools left. After a mid-turn
+        # compaction the resumed view ends with the summary resume instead of
+        # the assistant's tool call, so the content-based check would wrongly
+        # end the turn — keep the pre-compaction continuation decision.
+        if mid_turn_compacted:
+            has_runnable = pending_continuation
+        else:
+            last_content = next(
+                (m.content for m in reversed(manager.log) if m.role == "assistant"),
+                "",
+            )
+            has_runnable = any(
+                tooluse.is_runnable
+                for tooluse in ToolUse.iter_from_content(last_content)
+            )
         if not has_runnable:
             break
 
@@ -648,6 +663,43 @@ def _process_message_conversation(
             manager.append(msg)
     # Returning to the prompt acknowledges this turn, including hook output.
     manager.write(sync=True)
+
+
+def _has_pending_tooluse(log: Log) -> bool:
+    """True if the latest assistant message contains a runnable tool use."""
+    last_content = next(
+        (m.content for m in reversed(log) if m.role == "assistant"),
+        "",
+    )
+    return any(
+        tooluse.is_runnable for tooluse in ToolUse.iter_from_content(last_content)
+    )
+
+
+def _run_post_tool_compaction(manager: LogManager) -> bool:
+    """Run always-on compaction after tool results are on the CLI log.
+
+    Mirrors the server's ``_compact_after_tool_results``: TURN_POST fires only
+    after the *final* assistant message of the turn, so a large tool result
+    appended mid-turn would otherwise ride the continuation request past the
+    context budget with only ``limit_log`` as a last-resort guard (which drops
+    messages abruptly). The hook no-ops cheaply when the log is under budget.
+
+    Returns True if compaction switched the active view mid-turn (the caller
+    must keep the pre-compaction continuation decision, since the resumed log
+    ends with the summary resume instead of the assistant's tool call).
+    """
+    from .tools.autocompact.hook import autocompact_hook  # fmt: skip
+
+    view_before = manager.current_view
+    try:
+        for hook_msg in autocompact_hook(manager):
+            if isinstance(hook_msg, StopPropagation):
+                continue
+            manager.append(hook_msg)
+    except Exception:
+        logger.exception("Post-tool compaction failed in CLI chat loop")
+    return manager.current_view != view_before
 
 
 def _should_prompt_for_input(log: Log) -> bool:

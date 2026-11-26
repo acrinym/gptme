@@ -15,6 +15,25 @@ def test_chat_config_from_logdir(tmp_path: Path):
     assert loaded.model == "test-model"
 
 
+def test_chat_config_from_logdir_newer_mcp_metadata_preserves_saved_config(tmp_path: Path):
+    """An incompatible saved chat config must not break conversation listing."""
+    logdir = tmp_path / "conv"
+    logdir.mkdir()
+    saved = (
+        "[mcp]\nenabled = true\n"
+        "[[mcp.servers]]\nname = 'newer-server'\n"
+        "transport = 'streamable_http'\nurl = 'http://localhost:12345'\n"
+    )
+    path = logdir / "config.toml"
+    path.write_text(saved, encoding="utf-8")
+
+    loaded = ChatConfig.from_logdir(logdir)
+
+    assert loaded._logdir is None  # Never overwrite an incompatible original
+    assert loaded.workspace == logdir.resolve()
+    assert path.read_text(encoding="utf-8") == saved
+
+
 def test_chat_config_from_logdir_permission_error(tmp_path: Path, monkeypatch):
     """from_logdir must not crash when workspace dir can't be created (PermissionError).
 

@@ -19,6 +19,9 @@ function readMessage(value: unknown): string | null {
     ) {
       return obj.message;
     }
+    if (typeof obj.description === 'string' && obj.description.trim()) {
+      return obj.description;
+    }
     if ('error' in obj) {
       const nested = readMessage(obj.error);
       if (nested) {

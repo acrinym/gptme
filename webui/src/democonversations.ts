@@ -1,9 +1,15 @@
+import type { AgentInfo } from '@/types/api';
 import type { Message, ConversationSummary } from '@/types/conversation';
 
 // Fixed timestamp for demo content — always shows as historical, never "just now".
 // Using 2024-03-01 (approximate date of gptme-webui's first public release).
 const DEMO_EPOCH_ISO = '2024-03-01T00:00:00.000Z';
 const DEMO_EPOCH_UNIX = 1709251200; // Math.floor(new Date(DEMO_EPOCH_ISO).getTime() / 1000)
+
+/** Demo agent accent — GNOME yellow so the left-border is obvious on light and dark. */
+export const DEMO_AGENT: AgentInfo = { name: 'gptme', color: '#e5a50a' };
+/** Demo user fallback avatar — GNOME red, paired with contrast-aware text. */
+export const DEMO_USER_COLOR = '#c01c28';
 
 // Demo conversation message data
 const demoMessages: Record<string, Message[]> = {
@@ -154,6 +160,12 @@ const demoMessages: Record<string, Message[]> = {
   })),
 };
 
+function showStressTest(): boolean {
+  return (
+    typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('stress-test')
+  );
+}
+
 // Demo conversations (as ConversationSummary objects)
 export const demoConversations: ConversationSummary[] = [
   {
@@ -164,14 +176,20 @@ export const demoConversations: ConversationSummary[] = [
     readonly: true,
     workspace: '/demo/workspace',
   },
-  {
-    id: 'stress-test',
-    name: 'Stress test (200 messages)',
-    modified: DEMO_EPOCH_UNIX,
-    messages: demoMessages['stress-test'].length,
-    readonly: true,
-    workspace: '/demo/workspace',
-  },
+  // e2e fixture only: listed when the app is loaded with `?stress-test`, so
+  // users browsing the offline demo never see it.
+  ...(showStressTest()
+    ? [
+        {
+          id: 'stress-test',
+          name: 'Stress test (200 messages)',
+          modified: DEMO_EPOCH_UNIX,
+          messages: demoMessages['stress-test'].length,
+          readonly: true,
+          workspace: '/demo/workspace',
+        },
+      ]
+    : []),
 ];
 
 // Helper function to get demo conversation messages

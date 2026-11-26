@@ -1,7 +1,7 @@
 import { batch, mergeIntoObservable, observable } from '@legendapp/state';
 import type { ChatConfig, ConversationResponse } from '@/types/api';
 import type { Message, StreamingMessage, ToolUse } from '@/types/conversation';
-import { demoConversations, getDemoMessages } from '@/democonversations';
+import { DEMO_AGENT, demoConversations, getDemoMessages } from '@/democonversations';
 
 export interface PendingTool {
   id: string;
@@ -37,6 +37,11 @@ export interface ConversationState {
   isGenerating: boolean;
   // Whether this conversation has an active event stream
   isConnected: boolean;
+  // Generation of the pooled client that owns the current event subscription.
+  // Lets an open conversation re-subscribe after a credential-driven client
+  // replacement, while a second split-view instance sees the shared value and
+  // does not restart the live stream.
+  streamClientGeneration?: number | null;
   connectionStatus: ConversationConnectionStatus;
   reconnectAttempt: number | null;
   reconnectMaxAttempts: number | null;
@@ -452,6 +457,7 @@ export async function initializeConversations(
           logfile: id,
           branches: {},
           workspace: demoConv.workspace || '/demo/workspace',
+          agent: DEMO_AGENT,
         });
         return;
       }

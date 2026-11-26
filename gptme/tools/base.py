@@ -58,7 +58,18 @@ InitFunc: TypeAlias = Callable[[], "ToolSpec"]
 ToolFormat: TypeAlias = Literal["markdown", "xml", "tool"]
 
 # tooluse format
+# Process-wide default tool format, set once by the first init() call.
+# Threads that start with an empty context (e.g. server request threads) fall
+# back to it.
 tool_format: ToolFormat = "markdown"
+
+# Context-local tool format. Nested chat() sessions (thread-mode subagents)
+# call init()/set_tool_format() with their own format; keeping it in a
+# ContextVar prevents that from switching the parent session's parser, which
+# would make the parent's later tool calls silently unparseable.
+_tool_format_var: ContextVar[ToolFormat | None] = ContextVar(
+    "tool_format", default=None
+)
 
 # Match tool name and start of JSON
 toolcall_re = re.compile(
@@ -167,13 +178,21 @@ def using_current_tool_use(tool_use: ToolUse) -> Generator[ToolUse, None, None]:
         _current_tool_use.reset(token)
 
 
-def set_tool_format(new_format: ToolFormat):
+def set_tool_format(new_format: ToolFormat, *, process_default: bool = False) -> None:
+    """Set the tool format for the current context.
+
+    With ``process_default=True`` the format also becomes the fallback for
+    contexts that never set one (only the first ``init()`` should do this).
+    """
     global tool_format
-    tool_format = new_format
+    _tool_format_var.set(new_format)
+    if process_default:
+        tool_format = new_format
 
 
-def get_tool_format():
-    return tool_format
+def get_tool_format() -> ToolFormat:
+    fmt = _tool_format_var.get()
+    return tool_format if fmt is None else fmt
 
 
 class ExecuteFuncGen(Protocol):
@@ -462,6 +481,62 @@ def _loaded_tool_names() -> set[str] | None:
         return None
 
 
+# Provider-independent cap on tool descriptions. Tool descriptions (notably MCP
+# server descriptions) are attacker-controlled text that reaches the system
+# prompt; capping them bounds context-budget drain and the prompt-injection
+# surface on every provider, not just OpenAI (#1697 was OpenAI-scoped).
+MAX_TOOL_DESCRIPTION_LENGTH = 1024
+
+
+def truncate_tool_description(
+    description: str,
+    tool_name: str = "",
+    *,
+    limit: int = MAX_TOOL_DESCRIPTION_LENGTH,
+) -> str:
+    """Cap a tool description at ``limit`` characters, logging when it clips."""
+    if len(description) <= limit:
+        return description
+    logger.warning(
+        "Description for tool `%s` is too long (%d > %d chars). Truncating...",
+        tool_name,
+        len(description),
+        limit,
+    )
+    return description[:limit]
+
+
+def truncate_tool_description_xml(
+    description: str,
+    tool_name: str = "",
+    *,
+    limit: int = MAX_TOOL_DESCRIPTION_LENGTH,
+) -> str:
+    """XML-escape a tool description, capped so the *rendered* form fits ``limit``.
+
+    ``truncate_tool_description`` bounds the raw text, but XML escaping can
+    expand it (``&`` becomes ``&amp;``), so the rendered form could overshoot
+    the cap by up to 5x. Cap the escaped text instead, backing off a trailing
+    partial entity (``&am``) so the result stays valid XML.
+    """
+    escaped = xml_escape(description)
+    if len(escaped) <= limit:
+        return escaped
+    logger.warning(
+        "Description for tool `%s` is too long when XML-escaped (%d > %d chars). Truncating...",
+        tool_name,
+        len(escaped),
+        limit,
+    )
+    truncated = escaped[:limit]
+    # xml_escape emits an entity for every '&', so an '&' after the last ';'
+    # starts a partial entity — cut it so the output remains well-formed XML.
+    amp = truncated.rfind("&")
+    if amp > truncated.rfind(";"):
+        truncated = truncated[:amp]
+    return truncated
+
+
 # init=False is intentional: ToolSpec needs a wide constructor input type while
 # storing normalized fields. Dataclasses will not call __post_init__ here.
 @dataclass(frozen=True, eq=False, init=False)
@@ -688,7 +763,9 @@ class ToolSpec:
             return self._get_tool_prompt_xml(examples, tool_format)
         prompt = ""
         prompt += f"\n\n## {self.name}"
-        prompt += f"\n\n**Description:** {self.desc}" if self.desc else ""
+        if self.desc:
+            desc = truncate_tool_description(self.desc, self.name)
+            prompt += f"\n\n**Description:** {desc}"
         instructions = self.get_instructions(tool_format)
         if instructions:
             prompt += f"\n\n**Instructions:** {instructions}"
@@ -704,7 +781,8 @@ class ToolSpec:
         """Generate tool prompt with XML-sectioned structure."""
         parts = [f"\n<tool name={quoteattr(self.name)}>"]
         if self.desc:
-            parts.append(f"<description>{xml_escape(self.desc)}</description>")
+            desc = truncate_tool_description_xml(self.desc, self.name)
+            parts.append(f"<description>{desc}</description>")
         # Note: xml_escape is applied here, so any instructions_format["xml"] entry
         # should NOT embed raw XML markup — it would be double-escaped.
         # If a future tool needs unescaped XML in instructions, add a separate tag here.
@@ -1046,6 +1124,25 @@ class ToolUse:
         tool = get_tool(self.tool)
         return bool(tool.execute) if tool else False
 
+    @property
+    def preview_content(self) -> str | None:
+        """What to show when asking to confirm this call.
+
+        Tool-format calls (``@ipython(id): {...}``) carry their arguments in
+        ``kwargs`` and have no ``content``: show what the tool will run
+        (``command`` before ``code``, as shell/tmux run ``command``), else
+        all arguments. Non-string values fall through to the full dump.
+        """
+        if self.content:
+            return self.content
+        if not self.kwargs:
+            return None
+        for key in ("command", "code", "content"):
+            value = self.kwargs.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return json.dumps(self.kwargs, indent=2, default=str)
+
     @classmethod
     def _from_codeblock(cls, codeblock: Codeblock) -> ToolUse | None:
         """Parses a codeblock into a ToolUse. Codeblock must be a supported type.
@@ -1093,8 +1190,8 @@ class ToolUse:
             tool_format_override: Optional tool format override
             streaming: If True, requires blank line after code blocks for completion
         """
-        # Use override if provided, otherwise use global tool_format
-        active_format = tool_format_override or tool_format
+        # Use override if provided, otherwise the current context's format
+        active_format = tool_format_override or get_tool_format()
 
         # collect all tool uses
         tool_uses: list[ToolUse] = []

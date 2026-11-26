@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from ..context.config import parse_context_budget
 from ..tools import get_toolchain
 from ..tools._allowlist import (
     TOOL_PRESETS,
@@ -114,6 +115,8 @@ def setup_config_from_cli(
     stream: bool = True,
     interactive: bool = True,
     agent_path: Path | None = None,
+    allow_hosts: list[str] | None = None,
+    context_budget: float | int | None = None,
 ) -> Config:
     """
     Initialize and return a complete config from CLI arguments and workspace.
@@ -123,6 +126,9 @@ def setup_config_from_cli(
     environment -> chat/project ``[env].MODEL`` -> ``[models].default`` -> user
     ``[env].MODEL`` -> auto-detection.
     """
+
+    if context_budget is not None:
+        context_budget = parse_context_budget(context_budget, "--context-budget")
 
     # Load base config from workspace
     set_config_from_workspace(workspace)
@@ -281,6 +287,8 @@ def setup_config_from_cli(
             no_confirm=resolved_no_confirm,
             workspace=workspace,
             agent=resolved_agent_path,
+            allow_hosts=allow_hosts,
+            context_budget=context_budget,
         ),
     )
 

@@ -11,6 +11,7 @@ import { observable } from '@legendapp/state';
 import type { Message } from '@/types/conversation';
 import type { ExecutingTool } from '@/stores/conversations';
 import { ConversationContent } from '../ConversationContent';
+import { CONNECTION_GRACE_MS } from '@/hooks/useConnectionStatus';
 
 // Control how many items the virtualizer "renders" (simulates viewport size).
 // Defaults to Infinity so existing tests see all messages (no change in behaviour).
@@ -62,6 +63,8 @@ jest.mock('@/utils/stepGrouping', () => ({
 const mockNavigate = jest.fn();
 const mockConnect = jest.fn();
 const mockCheckConnection = jest.fn().mockResolvedValue(true);
+const mockGetUserInfo = jest.fn().mockResolvedValue({});
+const mockSecondaryGetUserInfo = jest.fn().mockResolvedValue({});
 const mockIsDemoMode = jest.fn(() => false);
 const mockIsLikelyChromeCorsPna = jest.fn((_url: string) => false);
 
@@ -73,6 +76,7 @@ const lastConnectionResult$ = observable<null | {
   message: string;
 }>(null);
 const sessions$ = observable(new Map<string, string>());
+const mockUserInfo$ = observable(null);
 
 // Secondary server observables for serverId tests
 const secondaryIsConnected$ = observable(true);
@@ -166,7 +170,7 @@ jest.mock('@/contexts/ApiContext', () => ({
       lastConnectionResult$,
       sessions$,
       authHeader: null,
-      getUserInfo: jest.fn().mockResolvedValue({}),
+      getUserInfo: mockGetUserInfo,
       step: jest.fn(),
       sendMessage: jest.fn(),
       subscribeToEvents: jest.fn(),
@@ -183,6 +187,9 @@ jest.mock('@/contexts/ApiContext', () => ({
           isConnected$: secondaryIsConnected$,
           lastConnectionResult$: secondaryLastConnectionResult$,
           checkConnection: secondaryCheckConnection,
+          getUserInfo: mockSecondaryGetUserInfo,
+          userInfo$: mockUserInfo$,
+          baseUrl: 'http://127.0.0.1:5701',
         };
       }
       // Unknown server ID falls back to primary (matches ApiContext behavior)
@@ -190,6 +197,9 @@ jest.mock('@/contexts/ApiContext', () => ({
         isConnected$,
         lastConnectionResult$,
         checkConnection: mockCheckConnection,
+        getUserInfo: mockGetUserInfo,
+        userInfo$: mockUserInfo$,
+        baseUrl: 'http://localhost:5700',
       };
     },
     connectionConfig: {
@@ -322,8 +332,37 @@ describe('server disconnected banner', () => {
 
   it('shows when disconnected and not in demo mode', () => {
     isConnected$.set(false);
+    lastConnectionResult$.set({
+      ok: false,
+      url: 'http://localhost:5700',
+      reason: 'network',
+      message: 'Network error',
+    });
     renderComponent();
     expect(screen.getByText(/server not connected/i)).toBeInTheDocument();
+  });
+
+  // gptme.ai: the banner flashed on every load and hourly token refresh, because
+  // "not connected yet" (nothing probed) rendered the same as "unreachable".
+  it('stays hidden while the first probe has not completed yet', () => {
+    isConnected$.set(false);
+    renderComponent();
+    expect(screen.queryByText(/server not connected/i)).toBeNull();
+  });
+
+  it('shows once the grace period passes without a connection', () => {
+    jest.useFakeTimers();
+    try {
+      isConnected$.set(false);
+      renderComponent();
+      expect(screen.queryByText(/server not connected/i)).toBeNull();
+      act(() => {
+        jest.advanceTimersByTime(CONNECTION_GRACE_MS);
+      });
+      expect(screen.getByText(/server not connected/i)).toBeInTheDocument();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('is hidden when disconnected but in intentional demo mode', () => {
@@ -371,6 +410,12 @@ describe('server disconnected banner', () => {
 
   it('shows a Retry button that calls connect()', async () => {
     isConnected$.set(false);
+    lastConnectionResult$.set({
+      ok: false,
+      url: 'http://localhost:5700',
+      reason: 'network',
+      message: 'Network error',
+    });
     renderComponent();
     const btn = screen.getByRole('button', { name: /retry/i });
     btn.click();
@@ -398,17 +443,36 @@ describe('server disconnected banner — serverId (secondary server)', () => {
 
   it('shows when the secondary server is disconnected, even if primary is connected', () => {
     secondaryIsConnected$.set(false);
+    secondaryLastConnectionResult$.set({
+      ok: false,
+      url: 'http://localhost:5700',
+      reason: 'network',
+      message: 'Network error',
+    });
     render(<ConversationContent conversationId="demo/test" serverId="secondary-server" />);
     expect(screen.getByText(/server not connected/i)).toBeInTheDocument();
   });
 
   it('Retry calls checkConnection() on the secondary server, not connect()', async () => {
     secondaryIsConnected$.set(false);
+    secondaryLastConnectionResult$.set({
+      ok: false,
+      url: 'http://localhost:5700',
+      reason: 'network',
+      message: 'Network error',
+    });
     render(<ConversationContent conversationId="demo/test" serverId="secondary-server" />);
     const btn = screen.getByRole('button', { name: /retry/i });
     btn.click();
     expect(secondaryCheckConnection).toHaveBeenCalled();
     expect(mockConnect).not.toHaveBeenCalled();
+  });
+
+  it('fetches user identity from the conversation server, not only the primary', () => {
+    secondaryIsConnected$.set(true);
+    render(<ConversationContent conversationId="demo/test" serverId="secondary-server" />);
+    expect(mockSecondaryGetUserInfo).toHaveBeenCalled();
+    expect(mockGetUserInfo).not.toHaveBeenCalled();
   });
 });
 

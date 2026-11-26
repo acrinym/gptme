@@ -3,7 +3,7 @@ import { useApi } from '@/contexts/ApiContext';
 import { useToast } from '@/components/ui/use-toast';
 import type { Message, StreamingMessage } from '@/types/conversation';
 import type { ChatOptions } from '@/components/ChatInput';
-import { demoConversations, getDemoMessages } from '@/democonversations';
+import { DEMO_AGENT, demoConversations, getDemoMessages } from '@/democonversations';
 import { isDemoMode } from '@/utils/connectionConfig';
 import { use$, useObservable } from '@legendapp/state/react';
 import {
@@ -36,7 +36,7 @@ import { playChime } from '@/utils/audio';
 import { speakText } from '@/utils/tts';
 import { findLatestAssistantIndexForError } from '@/utils/conversationErrorHandling';
 import { notifyGenerationComplete, notifyToolConfirmation } from '@/utils/notifications';
-import { ApiClientError, getApiErrorPresentation } from '@/utils/api';
+import { ApiClientError, getApiErrorPresentation, getClientGeneration } from '@/utils/api';
 import { toastStepStartError } from '@/utils/stepErrorHandling';
 
 const MAX_CONNECTED_CONVERSATIONS = 3;
@@ -116,7 +116,19 @@ export function useConversation(conversationId: string, serverId?: string) {
 
   // Load conversation data and connect to event stream
   useEffect(() => {
-    if (!isConnected || conversation$?.isConnected.get()) {
+    // A credential refresh swaps the pooled client (serverClients.ts disposes the
+    // replaced one), closing its stream while the conversation still reports
+    // "connected". The generation stored by the subscription then no longer
+    // matches the current client, so the effect re-subscribes on the
+    // replacement. Reading the generation from the shared store (rather than a
+    // per-instance ref) also keeps a second split-view instance from restarting
+    // the live stream: once the first instance subscribes, every instance sees
+    // the same generation.
+    const clientGeneration = getClientGeneration(api);
+    const stillConnectedOnThisClient =
+      conversation$?.isConnected.get() === true &&
+      conversation$?.streamClientGeneration?.get() === clientGeneration;
+    if (!isConnected || stillConnectedOnThisClient) {
       return;
     }
 
@@ -136,6 +148,7 @@ export function useConversation(conversationId: string, serverId?: string) {
               logfile: conversationId,
               branches: {},
               workspace: demoConv.workspace || '/demo/workspace',
+              agent: DEMO_AGENT,
             },
           });
           return;
@@ -231,7 +244,10 @@ export function useConversation(conversationId: string, serverId?: string) {
           }
         }
 
-        // Connect to event stream
+        // Connect to event stream. Record the client generation that owns the
+        // stream so all instances of this conversation agree a live subscription
+        // exists, and a replaced client is detected as stale.
+        updateConversation(conversationId, { streamClientGeneration: clientGeneration });
         api
           .subscribeToEvents(conversationId, {
             onMessageStart: () => {
@@ -522,9 +538,9 @@ export function useConversation(conversationId: string, serverId?: string) {
                   undefined,
                   initialStepStream ?? true,
                   'main',
-                  maxTokens,
-                  temperature,
-                  topP
+                  conversation$?.maxTokens?.get(),
+                  conversation$?.temperature?.get(),
+                  conversation$?.topP?.get()
                 )
                 .catch((error) => {
                   console.error('[useConversation] Error triggering initial step:', error);

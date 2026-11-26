@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from typing_extensions import Self
 
+from ..constants import valid_color
 from ..context.config import ContextConfig
 from ..context.selector.config import ContextSelectorConfig
 from ..util import path_with_tilde
@@ -201,6 +202,11 @@ class UserIdentityConfig:
     about: str | None = None
     response_preference: str | None = None
     avatar: str | None = None
+    color: str | None = None
+    """Display color for the user's name (hex, ``rgb(...)`` or a color name)."""
+
+    def __post_init__(self) -> None:
+        self.color = valid_color(self.color, "user")
 
 
 @dataclass
@@ -221,6 +227,20 @@ class ModelsConfig:
     # "anthropic/claude-opus-4-8"). Surfaced prominently in model pickers.
     favorites: list[str] = field(default_factory=list)
 
+    # Per-model overrides from ``[models."provider/model"]`` tables.
+    overrides: dict[str, "ModelConfig"] = field(default_factory=dict)
+
+    def get_context_budget(self, model_id: str) -> float | int | None:
+        override = self.overrides.get(model_id)
+        return override.context_budget if override is not None else None
+
+
+@dataclass
+class ModelConfig:
+    """Configuration overrides for one fully-qualified model ID."""
+
+    context_budget: float | int | None = None
+
 
 @dataclass
 class SettingsConfig:
@@ -238,6 +258,9 @@ class UserConfig:
     mcp: MCPConfig | None = None
     providers: list[ProviderConfig] = field(default_factory=list)
     lessons: "LessonsConfig | None" = None
+
+    # Context management defaults, layered below project configuration.
+    context: ContextConfig = field(default_factory=ContextConfig)
 
     # Model-related preferences (favorites, ...), under a [models] section.
     models: "ModelsConfig" = field(default_factory=lambda: ModelsConfig())
@@ -286,6 +309,11 @@ class AgentConfig:
         dashboard = "https://myagent.github.io/dashboard/"
         repo      = "https://github.com/myorg/myagent"
     """
+    color: str | None = None
+    """Display color for the agent's name (hex, ``rgb(...)`` or a color name)."""
+
+    def __post_init__(self) -> None:
+        self.color = valid_color(self.color, "agent")
 
 
 @dataclass

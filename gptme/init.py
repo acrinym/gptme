@@ -46,6 +46,7 @@ def init(
     no_confirm: bool = False,
     server: bool = False,
     require_llm: bool = True,
+    include_mcp: bool = True,
 ):
     """Initialize gptme.
 
@@ -59,12 +60,16 @@ def init(
         require_llm: If True (default), raise when LLM initialization fails.
             If False, log a warning and continue without a default model —
             callers (e.g. the server) can still accept per-request models.
+        include_mcp: If False, skip connecting MCP servers during init so a
+            server can bind its HTTP port first (gptme-tauri).
     """
     global _init_done
     if _init_done:
         logger.warning("init() called twice, ignoring")
         # Always update tool_format even on re-entry, as it may differ
-        # between conversations in the same process (e.g. test suite)
+        # between conversations in the same process (e.g. test suite, nested
+        # subagent chats). Context-local: a subagent thread's format must not
+        # change the parent session's tool-call parsing.
         set_tool_format(tool_format)
         return
 
@@ -83,7 +88,8 @@ def init(
             "Clients must supply a model per-request, or set an API key and restart.",
             first_line,
         )
-    init_tools(tool_allowlist)
+    init_tools(tool_allowlist, include_mcp=include_mcp)
+    _register_core_compaction_hook()
     init_hooks(interactive=interactive, no_confirm=no_confirm, server=server)
 
     config = get_config()
@@ -118,10 +124,30 @@ def init(
     # commands so bare aliases see the full registry). Never raises.
     register_skill_commands()
 
-    set_tool_format(tool_format)
+    set_tool_format(tool_format, process_default=True)
     # Mark initialization done at the end so callers can retry init()
     # after a failure earlier in this function.
     _init_done = True
+
+
+def _register_core_compaction_hook() -> None:
+    """Register the autocompact TURN_POST hook unconditionally.
+
+    Compaction is core behavior (not opt-in) as of Phase 1 of #3812.
+    The hook is registered here rather than relying on the autocompact *tool*
+    being explicitly loaded, so it fires regardless of the tool allowlist.
+    It uses the tool-qualified registry name so either registration replaces the
+    other instead of running the expensive decision twice.
+    """
+    from .hooks import HookType, register_hook  # fmt: skip
+    from .tools.autocompact.hook import autocompact_hook  # fmt: skip
+
+    register_hook(
+        "autocompact.autocompact",
+        HookType.TURN_POST,
+        autocompact_hook,
+        priority=100,
+    )
 
 
 def _init_plugins():

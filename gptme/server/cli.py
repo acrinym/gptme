@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import threading
 import time
 from pathlib import Path
@@ -64,6 +65,53 @@ from .constants import _pick_fallback_model
 logger = logging.getLogger(__name__)
 
 
+def _start_background_mcp(
+    tool_allowlist: list[str] | None,
+    host: str,
+    port: int,
+    listen_timeout: float = 15.0,
+) -> None:
+    """Connect MCP servers only after the HTTP listener is reachable.
+
+    Configured MCP stdio servers can take minutes (and dump schemas on
+    stderr). Doing that inside init() keeps :5700 closed, so gptme-tauri
+    reports "Unable to connect" and Settings shows 404 for the config file.
+
+    The loader thread starts before app.run() so it can wait in parallel,
+    but it does not call init_tools(include_mcp=True) until a TCP connection
+    to the just-started server succeeds.
+    """
+
+    connect_host = "::1" if host == "::" else "127.0.0.1" if host == "0.0.0.0" else host
+
+    def _load() -> None:
+        deadline = time.monotonic() + listen_timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((connect_host, port), timeout=0.25):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            logger.warning(
+                "HTTP listener %s:%d did not become reachable within %.1fs; "
+                "skipping background MCP initialization",
+                connect_host,
+                port,
+                listen_timeout,
+            )
+            return
+
+        try:
+            from gptme.tools import init_tools
+
+            init_tools(tool_allowlist, include_mcp=True)
+        except Exception:
+            logger.exception("Background MCP tool loading failed")
+
+    threading.Thread(target=_load, name="gptme-mcp-init", daemon=True).start()
+
+
 def _parse_tools_allowlist(tools: str | None) -> list[str] | None:
     """Parse the --tools value into an allowlist for init().
 
@@ -89,10 +137,14 @@ def _parse_tools_allowlist(tools: str | None) -> list[str] | None:
 def _pid_alive(pid: int) -> bool:
     """Check if a PID is still alive on this host.
 
-    Uses kill(pid, 0) which sends no signal but checks for the existence and
-    permission to signal the target. Returns False if the process is gone or
-    if EPERM means the PID was recycled by a different user.
+    POSIX uses ``kill(pid, 0)``, which sends no signal. Windows must not:
+    ``os.kill(pid, 0)`` is an invalid parameter (WinError 87). CPython raises
+    ``OSError``, but the PyInstaller CRT aborts the process instead — the
+    Tauri sidecar then logs ``Aborted!`` and exits while checking that the
+    desktop app is still running.
     """
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -102,6 +154,47 @@ def _pid_alive(pid: int) -> bool:
         # PID exists but we can't signal it — likely recycled to a different
         # user. Treat as dead so we don't keep watching a stale PID.
         return False
+    except OSError:
+        return False
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Return whether ``pid`` is a live Windows process.
+
+    ``ERROR_ACCESS_DENIED`` means the process exists but this token cannot
+    query it (a GUI parent such as gptme-tauri). That is still alive.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    if pid <= 0:
+        return False
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return int(code.value) == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _start_parent_death_watcher(
@@ -136,9 +229,10 @@ def _start_parent_death_watcher(
                     "Watched PID %d is gone, shutting down gptme-server",
                     initial_pid,
                 )
-                # Send SIGTERM to ourselves so Flask's signal handlers run and
-                # the `finally: shutdown_telemetry()` block fires.
-                os.kill(os.getpid(), signal.SIGTERM)
+                # Raise SIGTERM through Python's signal machinery so the installed
+                # handler runs on every platform. On Windows, os.kill(pid, SIGTERM)
+                # maps to TerminateProcess and bypasses Python cleanup entirely.
+                signal.raise_signal(signal.SIGTERM)
                 return
 
     thread = threading.Thread(target=_watcher, name="parent-death-watcher", daemon=True)
@@ -197,8 +291,11 @@ def main():
         __import__("flask")
     except ImportError:
         logger.error(
-            "gptme installed without needed extras for server. "
-            "Install them with `pip install gptme[server]`"
+            "This PATH gptme-server is the Python CLI, and Flask is missing. "
+            "The desktop app already has a server at "
+            r"%LOCALAPPDATA%\gptme\gptme-server.exe — do not start this command. "
+            'For the CLI server only: pip install "gptme[server]" '
+            "(the word server is a package extra, not a URL)."
         )
         exit(1)
 
@@ -323,13 +420,15 @@ def serve(
 
     # Try to initialize with provided/configured model
     # If init fails due to missing model/API keys, use fallback
+    tool_allowlist = _parse_tools_allowlist(tools)
     try:
         init(
             model,
             interactive=False,
-            tool_allowlist=_parse_tools_allowlist(tools),
+            tool_allowlist=tool_allowlist,
             tool_format="markdown",
             server=True,
+            include_mcp=False,
         )
     except (ValueError, KeyError) as e:
         error_msg = str(e)
@@ -357,10 +456,11 @@ def serve(
         init(
             fallback_model,
             interactive=False,
-            tool_allowlist=_parse_tools_allowlist(tools),
+            tool_allowlist=tool_allowlist,
             tool_format="markdown",
             server=True,
             require_llm=False,
+            include_mcp=False,
         )
 
     # Initialize telemetry (server is API/WebUI driven, not CLI interactive)
@@ -395,6 +495,8 @@ def serve(
         if allowed_hosts
         else None,
     )
+
+    _start_background_mcp(tool_allowlist, host, port)
 
     try:
         app.run(debug=debug, host=host, port=port)

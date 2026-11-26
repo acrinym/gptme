@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -35,12 +36,114 @@ from ..config import (
 )
 from ..credentials import STORED_CREDENTIALS_SOURCE, get_stored_api_key
 from ..info import get_config_info, get_installed_extras
-from ..llm import PROVIDER_API_KEYS, is_plugin_provider, list_available_providers
+from ..llm import (
+    PROVIDER_API_KEYS,
+    get_plugin_api_keys,
+    is_plugin_provider,
+    list_available_providers,
+)
 from ..llm.models import PROVIDERS, get_model, is_custom_provider
 from ..llm.validate import OAUTH_PROVIDERS, PROVIDER_DOCS, validate_api_key
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+# Placeholder API keys that are commonly left in config as scaffolding. A
+# provider is marked "available" whenever its key env var is set, so the doctor
+# would otherwise validate these against the live API and report a critical
+# ERROR for a key the user never intended to use. Treat them as not-configured
+# instead. Exact-match only, so a real key that merely contains a token like
+# "test" is never misclassified.
+_PLACEHOLDER_API_KEYS = frozenset(
+    {
+        "test",
+        "testing",
+        "dummy",
+        "dummy-key",
+        "placeholder",
+        "changeme",
+        "your-api-key",
+        "your-key-here",
+        "sk-xxx",
+        "sk-placeholder",
+        "sk-your-key",
+        "sk-test",
+        "sk-dummy",
+        "sk-1234567890",
+        "sk-ant-test",
+        "sk-ant-dummy",
+    }
+)
+
+
+def _is_placeholder_api_key(api_key: str) -> bool:
+    """Return True if an API key is a known placeholder literal.
+
+    Placeholder keys (e.g. "test", "dummy-key") are scaffolding left in config,
+    not real credentials. The doctor must not fire a critical ERROR for them —
+    the provider is only "available" because the env var is set, and validating
+    a placeholder against the live API always fails. Report them as not-configured
+    instead.
+    """
+    return api_key.strip().lower() in _PLACEHOLDER_API_KEYS
+
+
+def _resolve_provider_api_key(
+    provider: str, source: str | None, config: Config
+) -> str | None:
+    """Return the API key that made `provider` available, following runtime precedence.
+
+    Matches runtime auth, not just the discovery label:
+
+    - OAuth-authenticated providers use a token file, not an API key.
+    - Stored credentials are a fallback. ``list_available_providers`` records
+      stored keys before plugin env vars, so a plugin can be labeled stored
+      even when runtime uses ``api_key_env``. Prefer a live env key.
+    - Otherwise `source` is the env var that made the provider available
+      (``PROVIDER_API_KEYS`` entry or a plugin's ``api_key_env``).
+      ``config.get_env`` prefers ``GPTME_<KEY>`` over ``<KEY>``.
+    """
+    if source == "oauth":
+        return None
+    if source == STORED_CREDENTIALS_SOURCE:
+        env_var = PROVIDER_API_KEYS.get(provider) or get_plugin_api_keys().get(provider)
+        if env_var:
+            api_key = config.get_env(env_var)
+            if api_key:
+                return api_key
+        return get_stored_api_key(provider)
+    env_var = source or (
+        "AZURE_OPENAI_API_KEY" if provider == "azure" else f"{provider.upper()}_API_KEY"
+    )
+    return config.get_env(env_var)
+
+
+def _provider_has_placeholder_key(provider: str, source: str, config: Config) -> bool:
+    """Return True when the credential making `provider` available is a placeholder.
+
+    OAuth providers are never API-key gated: a stale placeholder under the
+    derived ``{PROVIDER}_API_KEY`` name must not hide a working login.
+    """
+    if source == "oauth":
+        return False
+    api_key = _resolve_provider_api_key(provider, source, config)
+    return isinstance(api_key, str) and _is_placeholder_api_key(api_key)
+
+
+def _usable_providers(config: Config | None = None) -> list[tuple[str, str]]:
+    """Available providers, excluding any configured only with a placeholder key.
+
+    `list_available_providers` marks a provider available whenever its key env var
+    is set, even for scaffolding literals like "test". The default-model and repair
+    checks must not treat such a provider as usable, or doctor can report
+    "All systems operational" for a model that cannot authenticate.
+    """
+    cfg = config or _doctor_config()
+    return [
+        (str(provider), source)
+        for provider, source in list_available_providers(cfg)
+        if not _provider_has_placeholder_key(str(provider), source, cfg)
+    ]
 
 
 class CheckStatus(Enum):
@@ -59,7 +162,7 @@ class CheckResult:
     name: str
     status: CheckStatus
     message: str
-    details: str | None = None
+    details: str | list[str] | None = None
     fix_hint: str | None = None
     provider: str | None = None
 
@@ -116,13 +219,27 @@ def _check_api_keys(verbose: bool = False) -> list[CheckResult]:
             # Key is configured, validate it
             env_var = special_env_vars.get(provider, f"{provider.upper()}_API_KEY")
 
-            # Retrieve the key from the same source that made the provider available.
+            # Same source and GPTME_ precedence as list_available_providers / runtime.
             source = available_provider_map[provider]
-            api_key = os.environ.get(env_var) or config.get_env(env_var)
-            if not api_key and source == STORED_CREDENTIALS_SOURCE:
-                api_key = get_stored_api_key(provider)
+            api_key = _resolve_provider_api_key(provider, source, config)
 
             if api_key:
+                # A placeholder key (e.g. "test", "dummy-key") is scaffolding, not
+                # a real credential. The provider is only "available" because the
+                # env var is set; validating a placeholder against the live API
+                # always fails and would fire a critical ERROR for a key the user
+                # never intended to use. Report it as not-configured instead.
+                if _is_placeholder_api_key(api_key):
+                    results.append(
+                        CheckResult(
+                            name=f"API Key: {provider}",
+                            status=CheckStatus.SKIPPED,
+                            message="Not configured (placeholder key)",
+                            fix_hint=f"Set a real key at: {PROVIDER_DOCS.get(provider, 'provider docs')}",
+                        )
+                    )
+                    continue
+
                 # Validate the key
                 is_valid, error_msg = validate_api_key(api_key, provider)
                 if is_valid and not error_msg:
@@ -205,7 +322,9 @@ def _model_source_label(source: str) -> str:
 def _check_default_model(verbose: bool = False) -> list[CheckResult]:
     """Check that the selected model routes through an available provider."""
     config = _doctor_config()
-    available = [str(provider) for provider, _ in list_available_providers(config)]
+    # A provider configured with only a placeholder key is not usable: it must not
+    # let the selected default model report OK (see _usable_providers).
+    available = [str(provider) for provider, _ in _usable_providers(config)]
     resolution = resolve_model_source(config)
 
     if resolution is None:
@@ -353,7 +472,7 @@ def _subscription_default_candidate(
     ):
         return None
 
-    available = {str(provider) for provider, _ in list_available_providers()}
+    available = {provider for provider, _ in _usable_providers()}
     if "openai-subscription" in available:
         return "openai-subscription"
     if "grok-subscription" in available:
@@ -1319,6 +1438,418 @@ def _check_mcp_stdio_server(
     ]
 
 
+def _discover_plugin_tools(mod_name: str) -> tuple[list, list[str]]:
+    """Discover a plugin module's tools, retaining siblings when one fails.
+
+    Unlike :func:`gptme.tools._discover_tools`, a submodule that raises during
+    import or spec collection is reported as a per-module verdict instead of
+    discarding every tool already found in healthy sibling submodules.
+    """
+    import importlib
+    import pkgutil
+    from types import ModuleType
+
+    from ..tools import _iter_tool_specs
+
+    errors: list[str] = []
+    tools: list[object] = []
+
+    try:
+        root = importlib.import_module(mod_name)
+    except Exception as exc:
+        return [], [f"{mod_name}:error(import {type(exc).__name__}: {exc})"]
+
+    def _collect(module_name: str, module: ModuleType) -> None:
+        try:
+            tools.extend(_iter_tool_specs(module))
+        except Exception as exc:
+            errors.append(f"{module_name}:error(discover {type(exc).__name__}: {exc})")
+        path = getattr(module, "__path__", None)
+        if path is None:
+            return
+        try:
+            submodules = sorted(pkgutil.iter_modules(path))
+        except Exception as exc:
+            # Enumeration itself can raise for an unreadable package path; that
+            # must be this module's verdict, not an aborted doctor run.
+            errors.append(f"{module_name}:error(enumerate {type(exc).__name__}: {exc})")
+            return
+        for _, submodule_name, _ in submodules:
+            if submodule_name.startswith("_"):
+                continue
+            full_name = f"{module_name}.{submodule_name}"
+            try:
+                submodule = importlib.import_module(full_name)
+            except Exception as exc:
+                errors.append(f"{full_name}:error(import {type(exc).__name__}: {exc})")
+                continue
+            _collect(full_name, submodule)
+
+    _collect(mod_name, root)
+    return tools, errors
+
+
+def _iter_plugin_tools(plugin: object) -> tuple[list, list[str]]:
+    """Collect direct tools and tools discovered from ``tool_modules``.
+
+    Returns ``(tools, import_errors)``. Import errors are already formatted as
+    per-item verdict strings (``module:error(import ...)``).
+    """
+    from ..plugins.plugin import GptmePlugin
+    from ..tools.base import ToolSpec
+
+    if not isinstance(plugin, GptmePlugin):
+        raise TypeError(f"expected GptmePlugin, got {type(plugin).__name__}")
+
+    tools: list[ToolSpec] = []
+    seen_names: set[str] = set()
+    import_errors: list[str] = []
+
+    def _add(tool: object) -> None:
+        if not isinstance(tool, ToolSpec):
+            import_errors.append(f"{type(tool).__name__}:error(not a ToolSpec)")
+            return
+        if tool.name in seen_names:
+            return
+        seen_names.add(tool.name)
+        tools.append(tool)
+
+    for tool in plugin.tools:
+        _add(tool)
+
+    for mod_name in plugin.tool_modules:
+        discovered, errors = _discover_plugin_tools(mod_name)
+        import_errors.extend(errors)
+        for tool in discovered:
+            _add(tool)
+
+    return tools, import_errors
+
+
+def _check_plugin_registrar(
+    kind: Literal["hooks", "commands"], registrar: Callable[[], object]
+) -> tuple[str, bool]:
+    """Run a plugin registrar in isolation and validate its return contract."""
+    if kind == "hooks":
+        from ..hooks.registry import HookRegistry, get_registry, set_registry
+
+        original_registry = get_registry()
+        isolated_registry = HookRegistry()
+        set_registry(isolated_registry)
+        try:
+            returned = registrar()
+            registered = len(isolated_registry.get_hooks())
+        except Exception as exc:
+            return f"hooks:error({type(exc).__name__}: {exc})", True
+        finally:
+            set_registry(original_registry)
+    else:
+        from ..commands.base import (
+            _command_completers,
+            _command_owners,
+            _command_registry,
+        )
+
+        registry_before = dict(_command_registry)
+        completers_before = dict(_command_completers)
+        owners_before = dict(_command_owners)
+        try:
+            returned = registrar()
+            # Count commands the registrar newly added. Overriding an existing
+            # command with a different handler object is not a new registration,
+            # so comparing handler identity would overstate the count.
+            registered = sum(
+                1 for name in _command_registry if name not in registry_before
+            )
+        except Exception as exc:
+            return f"commands:error({type(exc).__name__}: {exc})", True
+        finally:
+            _command_registry.clear()
+            _command_registry.update(registry_before)
+            _command_completers.clear()
+            _command_completers.update(completers_before)
+            _command_owners.clear()
+            _command_owners.update(owners_before)
+
+    if returned is not None:
+        return (
+            (
+                f"{kind}:error(register_{kind}() returned "
+                f"{type(returned).__name__}, expected None)"
+            ),
+            True,
+        )
+    return f"{kind}:ok({registered} registered)", False
+
+
+def _check_plugins(verbose: bool = False) -> list[CheckResult]:
+    """Check installed gptme plugins via entry points.
+
+    Discovers plugins registered under the ``gptme.plugins`` entry-point group,
+    skips entry points disabled by ``plugins.enabled`` without importing them,
+    scans third-party distribution source before import, then validates each
+    plugin's init, tool, and registrar contracts. Tools come from both
+    ``plugin.tools`` and ``plugin.tool_modules``.
+    Returns one :class:`CheckResult` per plugin with a machine-readable
+    per-item verdict list in the ``details`` field.
+    """
+    from importlib.metadata import entry_points as _entry_points
+
+    from ..plugins.entrypoints import ENTRYPOINT_GROUP, _coerce_to_plugin, _normalize
+    from ..plugins.security import scan_plugin_entry_point
+    from ..tools.base import ToolSpec
+
+    results: list[CheckResult] = []
+    _, enabled = get_config().get_plugin_config()
+    enabled_normalized = (
+        {_normalize(name) for name in enabled} if enabled is not None else None
+    )
+
+    try:
+        eps = list(_entry_points(group=ENTRYPOINT_GROUP))
+    except Exception as exc:
+        results.append(
+            CheckResult(
+                name="Plugin: discovery",
+                status=CheckStatus.ERROR,
+                message=f"Entry-point discovery failed: {exc}",
+            )
+        )
+        return results
+
+    if not eps:
+        results.append(
+            CheckResult(
+                name="Plugin: installed",
+                status=CheckStatus.OK,
+                message="No plugins registered (gptme.plugins entry-point group is empty)",
+            )
+        )
+        return results
+
+    results.append(
+        CheckResult(
+            name="Plugin: installed",
+            status=CheckStatus.OK,
+            message=f"{len(eps)} plugin(s) registered",
+            details=", ".join(ep.name for ep in eps) if verbose else None,
+        )
+    )
+
+    for ep in eps:
+        ep_name = ep.name
+
+        # Match discover_entrypoint_plugins(): skip disabled entry points
+        # without importing them. Import executes package code.
+        module = (
+            getattr(ep, "module", None)
+            or str(getattr(ep, "value", "")).split(":")[0].strip()
+        )
+        ep_names = {_normalize(ep_name)}
+        if module:
+            ep_names.add(_normalize(module.split(".")[0]))
+        if enabled_normalized is not None and not (ep_names & enabled_normalized):
+            results.append(
+                CheckResult(
+                    name=f"Plugin: {ep_name}",
+                    status=CheckStatus.SKIPPED,
+                    message="disabled by plugins.enabled; not loaded",
+                )
+            )
+            continue
+
+        # 1 — scan third-party distribution source before importing it. Importing
+        # first would execute exactly the payload this check is meant to catch.
+        # A scan that itself raises must not abort the whole doctor run: report a
+        # verdict for this plugin and move on.
+        security_verdicts: list[str] = []
+        try:
+            security_scan = scan_plugin_entry_point(ep)
+        except Exception as exc:
+            results.append(
+                CheckResult(
+                    name=f"Plugin: {ep_name}",
+                    status=CheckStatus.ERROR,
+                    message=f"Security scan failed: {type(exc).__name__}",
+                    details=str(exc),
+                    fix_hint=(
+                        f"Check the distribution metadata for {ep_name!r}; "
+                        "a malformed install cannot be scanned before import"
+                    ),
+                )
+            )
+            continue
+        if security_scan is not None:
+            if security_scan.findings:
+                results.append(
+                    CheckResult(
+                        name=f"Plugin: {ep_name}",
+                        status=CheckStatus.ERROR,
+                        message="Security scan blocked import",
+                        details=[
+                            finding.verdict() for finding in security_scan.findings
+                        ],
+                        fix_hint=(
+                            f"Remove or audit the package providing {ep_name!r} "
+                            "before loading it"
+                        ),
+                    )
+                )
+                continue
+            # Fail closed: a clean result only means something when the module
+            # that would be imported was actually scanned. Otherwise a plugin can
+            # place its executable source in an unreadable or oversized file and
+            # still be reported as verified.
+            if not security_scan.entry_point_scanned:
+                results.append(
+                    CheckResult(
+                        name=f"Plugin: {ep_name}",
+                        status=CheckStatus.ERROR,
+                        message="Security scan could not verify entry point",
+                        details=[
+                            (
+                                "security:error(unverified: entry-point module not "
+                                f"scanned; {security_scan.scanned_files} file(s) scanned)"
+                            )
+                        ],
+                        fix_hint=(
+                            f"Ensure {ep_name!r} ships its entry-point module as "
+                            "readable source under 1 MB"
+                        ),
+                    )
+                )
+                continue
+            security_verdicts.append(
+                f"security:ok({security_scan.scanned_files} files scanned)"
+            )
+
+        # 2 — try to import the entry point
+        try:
+            obj = ep.load()
+        except Exception as exc:
+            results.append(
+                CheckResult(
+                    name=f"Plugin: {ep_name}",
+                    status=CheckStatus.ERROR,
+                    message=f"Import failed: {type(exc).__name__}",
+                    details=str(exc),
+                    fix_hint=f"Check that the package providing {ep_name!r} is installed correctly",
+                )
+            )
+            continue
+
+        # 3 — coerce to GptmePlugin
+        plugin = _coerce_to_plugin(ep_name, obj)
+        if plugin is None:
+            results.append(
+                CheckResult(
+                    name=f"Plugin: {ep_name}",
+                    status=CheckStatus.ERROR,
+                    message="Entry point did not export a GptmePlugin or ToolSpec",
+                    details=f"Got {type(obj).__name__!r}",
+                    fix_hint=(
+                        "Register a GptmePlugin instance or a ToolSpec at the entry point"
+                    ),
+                )
+            )
+            continue
+
+        # 4 — plugin-level init() runs before subsystem init at runtime.
+        contract_verdicts: list[str] = list(security_verdicts)
+        any_failed = False
+        if plugin.init is not None:
+            try:
+                plugin.init(get_config())
+                contract_verdicts.append("init:ok")
+            except Exception as exc:
+                contract_verdicts.append(f"init:error({type(exc).__name__}: {exc})")
+                any_failed = True
+
+        # 5 — validate each tool's init() contract (direct + module-provided)
+        try:
+            tools, import_errors = _iter_plugin_tools(plugin)
+        except Exception as exc:
+            results.append(
+                CheckResult(
+                    name=f"Plugin: {ep_name}",
+                    status=CheckStatus.ERROR,
+                    message=f"Tool discovery failed: {type(exc).__name__}",
+                    details=str(exc),
+                    fix_hint=(
+                        "Check the plugin's tools/tool_modules entries; "
+                        "a malformed manifest must not abort doctor"
+                    ),
+                )
+            )
+            continue
+        contract_verdicts.extend(import_errors)
+        any_failed = any_failed or bool(import_errors)
+        for tool in tools:
+            if tool.init is None:
+                contract_verdicts.append(f"{tool.name}:ok(no-init)")
+                continue
+            try:
+                initialized = tool.init()
+                if not isinstance(initialized, ToolSpec):
+                    contract_verdicts.append(
+                        f"{tool.name}:error(init() returned {type(initialized).__name__}, expected ToolSpec)"
+                    )
+                    any_failed = True
+                else:
+                    contract_verdicts.append(f"{tool.name}:ok")
+            except Exception as exc:
+                contract_verdicts.append(
+                    f"{tool.name}:error({type(exc).__name__}: {exc})"
+                )
+                any_failed = True
+
+        # 6 — validate hook and command registration contracts. Each callback
+        # runs against a temporary registry so doctor never mutates runtime state.
+        if plugin.register_hooks is not None:
+            verdict, failed = _check_plugin_registrar("hooks", plugin.register_hooks)
+            contract_verdicts.append(verdict)
+            any_failed |= failed
+        if plugin.register_commands is not None:
+            verdict, failed = _check_plugin_registrar(
+                "commands", plugin.register_commands
+            )
+            contract_verdicts.append(verdict)
+            any_failed |= failed
+
+        n_tools = len(tools)
+        n_failed = sum(1 for verdict in contract_verdicts if ":error(" in verdict)
+        if any_failed:
+            status = CheckStatus.ERROR
+            message = f"{n_failed}/{len(contract_verdicts)} plugin check(s) failed"
+        elif n_tools == 0:
+            status = CheckStatus.OK
+            message = f"{plugin.name}: loaded (no tools)"
+        else:
+            status = CheckStatus.OK
+            message = f"{plugin.name}: {n_tools} tool(s) ok"
+
+        # details is a list so --json consumers can parse per-item verdicts
+        # even when an error message contains the old " | " delimiter.
+        details = contract_verdicts or None
+
+        results.append(
+            CheckResult(
+                name=f"Plugin: {ep_name}",
+                status=status,
+                message=message,
+                details=details,
+                fix_hint=(
+                    "Check the plugin's tool init or registration implementation; "
+                    "run with --verbose to see per-capability verdicts"
+                )
+                if any_failed
+                else None,
+            )
+        )
+
+    return results
+
+
 def _summarize_results(results: list[CheckResult]) -> dict[str, int]:
     """Count diagnostic results by status."""
     return {
@@ -1343,6 +1874,9 @@ def run_diagnostics(verbose: bool = False) -> tuple[list[CheckResult], dict[str,
     all_results.extend(_check_version(verbose))
     all_results.extend(_check_config(verbose))
     all_results.extend(_check_proxy(verbose))
+    # Plugin discovery initializes the unified registry used by provider
+    # checks, so it must run before API-key and default-model validation.
+    all_results.extend(_check_plugins(verbose))
     all_results.extend(_check_api_keys(verbose))
     all_results.extend(_check_default_model(verbose))
     all_results.extend(_check_tools(verbose))
@@ -1390,7 +1924,12 @@ def print_results(
             # Build message with optional details
             msg = result.message
             if verbose and result.details:
-                msg += f"\n  [dim]{result.details}[/dim]"
+                detail_text = (
+                    result.details
+                    if isinstance(result.details, str)
+                    else "\n  ".join(result.details)
+                )
+                msg += f"\n  [dim]{detail_text}[/dim]"
 
             table.add_row(emoji, name, msg)
 

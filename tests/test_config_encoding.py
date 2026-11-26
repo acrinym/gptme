@@ -285,6 +285,28 @@ def test_undecodable_config_fails_at_the_parser_not_the_decoder(tmp_path: Path):
         user_mod.load_user_config(str(config_file))
 
 
+def test_read_config_text_normalizes_bare_cr_newlines(tmp_path: Path):
+    """Bare CR / ``\\r\\r\\n`` must not crash tomlkit (Windows editor artifact).
+
+    gptme-server (including the Tauri sidecar) loads ``~/.config/gptme/config.toml``
+    at startup; ``InvalidControlChar`` on bare CR takes the whole process down and
+    leaves the UI talking to a dead API.
+    """
+    config_file = tmp_path / "config.toml"
+    # Mixed endings: normal CRLF, then accidental bare CR before LF.
+    config_file.write_bytes(
+        b'[user]\r\nname = "User"\r\r\nabout = "hi"\r\n'
+        b'[models]\r\r\ndefault = "openai/gpt-4o"\r\n'
+    )
+
+    text = user_mod._read_config_text(config_file)
+
+    assert "\r" not in text
+    cfg = user_mod.load_user_config(str(config_file))
+    assert cfg.user.name == "User"
+    assert cfg.models.default == "openai/gpt-4o"
+
+
 @pytest.mark.parametrize("locale_codec", ["UTF-8", "utf8", "cp936"])
 def test_read_config_text_never_raises_unicode_decode_error(
     tmp_path: Path, locale_codec: str

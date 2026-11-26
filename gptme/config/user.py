@@ -6,6 +6,7 @@ from optional config.runtime.toml defaults, config.toml, and config.local.toml.
 
 import codecs
 import copy
+import dataclasses
 import locale
 import logging
 import os
@@ -21,12 +22,15 @@ if TYPE_CHECKING:
     from tomlkit.container import Container
     from tomlkit.items import AoT
 
+from ..context.config import parse_context_budget as _parse_context_budget
 from ..util import path_with_tilde
 from .models import (
+    ContextConfig,
     HooksConfig,
     LessonsConfig,
     MCPConfig,
     MCPServerConfig,
+    ModelConfig,
     ModelsConfig,
     PluginsConfig,
     ProviderConfig,
@@ -167,10 +171,15 @@ def _read_config_text(path: str | Path) -> str:
     value leave the document well-formed -- so replacement is treated as a guess
     too, and the more damaging one: U+FFFD discards which byte it stood for, so
     only the backup can undo it.
+
+    Newlines are normalized to LF after decoding. TOML allows LF and CRLF, but
+    tomlkit rejects bare CR (common after Windows editors produce ``\\r\\r\\n``).
+    Normalizing in memory keeps gptme-server from dying on an otherwise valid
+    config; the next successful write re-saves as LF.
     """
     data = Path(path).read_bytes()
     try:
-        return data.decode("utf-8")
+        return _normalize_toml_newlines(data.decode("utf-8"))
     except UnicodeDecodeError:
         pass
 
@@ -188,7 +197,7 @@ def _read_config_text(path: str | Path) -> str:
             "rewrites the file as UTF-8."
         )
         _mark_encoding_unverified(path)
-        return text
+        return _normalize_toml_newlines(text)
 
     logger.warning(
         f"Config file {path} is not valid UTF-8 and no legacy codec could decode "
@@ -196,7 +205,17 @@ def _read_config_text(path: str | Path) -> str:
         "and the original bytes are saved before anything rewrites the file."
     )
     _mark_encoding_unverified(path)
-    return data.decode("utf-8", errors="replace")
+    return _normalize_toml_newlines(data.decode("utf-8", errors="replace"))
+
+
+def _normalize_toml_newlines(text: str) -> str:
+    """Normalize CRLF and bare CR to LF for tomlkit.
+
+    tomlkit raises ``InvalidControlChar`` on bare ``\\r`` (code 0x0d). Mixed
+    Windows line endings such as ``\\r\\r\\n`` therefore crash config load and
+    take down gptme-server (including the Tauri sidecar).
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 # Define the path to the config file
@@ -295,11 +314,11 @@ def get_user_config_runtime_path(path: str | None = None) -> Path:
 def _load_runtime_config_doc(path: str | None = None) -> TOMLDocument | None:
     """Read runtime defaults without creating, repairing, or rewriting the file."""
     runtime_path = get_user_config_runtime_path(path)
-    try:
-        text = runtime_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    if not runtime_path.exists():
         return None
-    except (OSError, UnicodeError) as exc:
+    try:
+        text = _read_config_text(runtime_path)
+    except OSError as exc:
         raise ValueError(
             f"Could not read runtime config {runtime_path}: {exc}"
         ) from exc
@@ -429,9 +448,18 @@ def load_user_config(path: str | None = None) -> UserConfig:
         ) from exc
 
 
+def _serialize_user_config(config: UserConfig) -> dict[str, Any]:
+    """Serialize model overrides using their public TOML table shape."""
+    data = asdict(config)
+    model_data = data["models"]
+    overrides = model_data.pop("overrides", {})
+    model_data.update(overrides)
+    return _strip_none(data)
+
+
 def _with_builtin_defaults(config: dict[str, Any]) -> dict[str, Any]:
     """Apply built-in defaults beneath the explicit runtime/main/local layers."""
-    defaults = _strip_none(asdict(default_config))
+    defaults = _serialize_user_config(default_config)
     prompt = config.get("prompt", {})
     if isinstance(prompt, dict):
         # Legacy prompt preferences must still beat built-in user defaults.
@@ -600,11 +628,8 @@ def _load_user_config(path: str | None, runtime_doc: TOMLDocument | None) -> Use
     if resp_pref is None and prompt.response_preference is not None:
         resp_pref = prompt.response_preference
     if about != user_identity.about or resp_pref != user_identity.response_preference:
-        user_identity = UserIdentityConfig(
-            name=user_identity.name,
-            about=about,
-            response_preference=resp_pref,
-            avatar=user_identity.avatar,
+        user_identity = dataclasses.replace(
+            user_identity, about=about, response_preference=resp_pref
         )
 
     env = config.pop("env", {})
@@ -664,19 +689,47 @@ def _load_user_config(path: str | None, runtime_doc: TOMLDocument | None) -> Use
     if not isinstance(models_data, dict):
         logger.warning(f"[models] should be a table, got {type(models_data).__name__}")
         models_data = {}
-    favorites_data = models_data.get("favorites", [])
+    favorites_data = models_data.pop("favorites", [])
     if not isinstance(favorites_data, list):
         logger.warning(
             f"[models].favorites should be a list, got {type(favorites_data).__name__}"
         )
         favorites_data = []
-    default_model = models_data.get("default")
+    default_model = models_data.pop("default", None)
     if default_model is not None and not isinstance(default_model, str):
         logger.warning("[models].default should be a string")
         default_model = None
+
+    overrides: dict[str, ModelConfig] = {}
+    for model_id, model_data in models_data.items():
+        if not isinstance(model_data, dict):
+            logger.warning(
+                f"[models.{model_id!r}] should be a table, got "
+                f"{type(model_data).__name__}"
+            )
+            continue
+        unknown = set(model_data) - {"context_budget"}
+        if unknown:
+            logger.warning(
+                f"Unknown keys in [models.{model_id!r}]: {sorted(unknown)} (ignored)"
+            )
+        budget = model_data.get("context_budget")
+        if budget is None:
+            if not unknown:
+                logger.warning(
+                    f"[models.{model_id!r}] has no recognized overrides (ignored)"
+                )
+            continue
+        overrides[model_id] = ModelConfig(
+            context_budget=_parse_context_budget(
+                budget, f'models."{model_id}".context_budget'
+            )
+        )
+
     models_config = ModelsConfig(
         default=default_model,
         favorites=[str(m) for m in favorites_data if isinstance(m, str)],
+        overrides=overrides,
     )
 
     # Parse lessons config
@@ -686,6 +739,11 @@ def _load_user_config(path: str | None, runtime_doc: TOMLDocument | None) -> Use
         if lessons_data and isinstance(lessons_data, dict)
         else None
     )
+
+    context_data = config.pop("context", {})
+    if not isinstance(context_data, dict):
+        raise ValueError("context must be an object")
+    context = ContextConfig.from_dict(context_data)
 
     # Parse [plugins] section (search paths + enabled allowlist)
     plugins_data = config.pop("plugins", {})
@@ -730,6 +788,7 @@ def _load_user_config(path: str | None, runtime_doc: TOMLDocument | None) -> Use
         mcp=mcp,
         providers=providers,
         lessons=lessons,
+        context=context,
         models=models_config,
         plugins=plugins,
         settings=settings,
@@ -759,7 +818,7 @@ def _load_config_doc(path: str | None = None) -> tomlkit.TOMLDocument:
         initial = (
             {}
             if get_user_config_runtime_path(path).exists()
-            else _strip_none(asdict(default_config))
+            else _serialize_user_config(default_config)
         )
         toml = tomlkit.dumps(initial)
         with open(path, "w", encoding="utf-8") as config_file:

@@ -21,12 +21,13 @@ from typing_extensions import Self
 if sys.version_info >= (3, 11):
     import tomllib
 
-    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError)
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError)
 else:
     tomllib = None
 
-    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, TOMLKitError)
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, ValueError, TOMLKitError)
 
+from ..context.config import parse_context_budget
 from ..util import path_with_tilde
 from .models import AgentConfig, MCPConfig
 from .project import get_project_config
@@ -126,6 +127,8 @@ class ChatConfig:
     watch_autowake: bool | None = None
     # Max tokens for the model's response. None = provider/model default.
     max_tokens: int | None = None
+    # One-chat compaction budget override from ``--context-budget``.
+    context_budget: float | int | None = None
     # Sampling temperature override. None = use TEMPERATURE constant (env default 0).
     temperature: float | None = None
     # Top-p nucleus sampling override. None = use TOP_P constant (env default 0.1).
@@ -138,6 +141,10 @@ class ChatConfig:
 
     env: dict = field(default_factory=dict)
     mcp: MCPConfig | None = None
+    # Hostname allowlist for web tool access. None = unrestricted (default).
+    # Wildcard subdomains: "*.github.com" matches "api.github.com".
+    # Set via --allow-hosts or GPTME_ALLOW_HOSTS env var.
+    allow_hosts: list[str] | None = None
 
     @property
     def agent_config(self) -> AgentConfig | None:
@@ -211,6 +218,11 @@ class ChatConfig:
                 raise ValueError(
                     f"chat.{field_name} must be a number, got {type(val).__name__}"
                 )
+        context_budget = chat_data.get("context_budget")
+        if context_budget is not None:
+            chat_data["context_budget"] = parse_context_budget(
+                context_budget, "chat.context_budget"
+            )
         watch_autowake_val = chat_data.get("watch_autowake")
         if watch_autowake_val is not None and not isinstance(watch_autowake_val, bool):
             raise ValueError(
@@ -485,6 +497,7 @@ class ChatConfig:
                     "tools",
                     "agent",
                     "watch_autowake",
+                    "context_budget",
                 ]
                 and cli_value is not None
             ):
@@ -499,6 +512,7 @@ class ChatConfig:
                     "tools",
                     "agent",
                     "watch_autowake",
+                    "context_budget",
                 ]
                 and cli_value != default_value
             ):

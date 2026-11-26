@@ -5,6 +5,27 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+    # startup/size benchmarks only depend on the Python package and its deps
+    paths:
+      - 'gptme/**'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'gptme.toml'
+      # files and lessons the repo's gptme.toml loads in the start/exit cycle
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'docs/glossary.md'
+      - 'docs/lessons/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - '.github/workflows/benchmark.yml'
+
+# Cancel a PR's older runs when it gets a new push (they're superseded).
+# Every other run (master push, release, dispatch, schedule) gets its own
+# group, so none of them can cancel or replace another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   pull-requests: write
@@ -13,6 +34,7 @@ jobs:
   benchmark:
     name: Startup Benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v7
 
